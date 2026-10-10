@@ -1,16 +1,36 @@
 import { Redis } from '@upstash/redis';
 
-// Support both standard Upstash Redis and Vercel KV environment variables
-const url = process.env.UPSTASH_REDIS_REST_URL || process.env.KV_REST_API_URL;
-const token = process.env.UPSTASH_REDIS_REST_TOKEN || process.env.KV_REST_API_TOKEN;
+// Support standard Upstash Redis and Vercel KV environment variables
+const url =
+  process.env.UPSTASH_REDIS_REST_URL ||
+  process.env.KV_REST_API_URL ||
+  process.env.REDIS_URL;
+
+const token =
+  process.env.UPSTASH_REDIS_REST_TOKEN ||
+  process.env.KV_REST_API_TOKEN ||
+  process.env.REDIS_TOKEN;
+
+export const isUpstashConfigured = Boolean(url && token);
+export const isProduction = process.env.NODE_ENV === 'production' || Boolean(process.env.VERCEL);
 
 /**
  * In-Memory fallback adapter for offline development and testing
- * when Upstash Redis credentials are not provided in the environment.
+ * when Upstash Redis credentials are not provided in the local environment.
  */
 class MemoryRedisStore {
   private kv = new Map<string, { value: any; expireAt?: number }>();
   private zsets = new Map<string, Map<string, number>>();
+
+  private checkProductionWarning() {
+    if (isProduction && !isUpstashConfigured) {
+      console.warn(
+        '⚠️ [BLUFF WARNING]: Running in production without UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN. ' +
+        'Multiplayer state will not persist across serverless function invocations. ' +
+        'Please link Upstash Redis or Vercel KV in your Vercel project Storage tab.'
+      );
+    }
+  }
 
   private isExpired(entry?: { value: any; expireAt?: number }): boolean {
     if (!entry) return true;
@@ -26,6 +46,7 @@ class MemoryRedisStore {
   }
 
   async get<T = any>(key: string): Promise<T | null> {
+    this.checkProductionWarning();
     this.cleanKey(key);
     const entry = this.kv.get(key);
     if (!entry) return null;
@@ -33,6 +54,7 @@ class MemoryRedisStore {
   }
 
   async set(key: string, value: any, opts?: { ex?: number; nx?: boolean }): Promise<'OK' | null> {
+    this.checkProductionWarning();
     this.cleanKey(key);
     if (opts?.nx && this.kv.has(key)) {
       return null;
@@ -43,11 +65,13 @@ class MemoryRedisStore {
   }
 
   async del(key: string): Promise<number> {
+    this.checkProductionWarning();
     const existed = this.kv.delete(key) || this.zsets.delete(key);
     return existed ? 1 : 0;
   }
 
   async expire(key: string, seconds: number): Promise<number> {
+    this.checkProductionWarning();
     const entry = this.kv.get(key);
     if (entry) {
       entry.expireAt = Date.now() + seconds * 1000;
@@ -57,6 +81,7 @@ class MemoryRedisStore {
   }
 
   async zadd(key: string, memberOrOpts: { score: number; member: string } | { score: number; member: string }[]): Promise<number> {
+    this.checkProductionWarning();
     if (!this.zsets.has(key)) {
       this.zsets.set(key, new Map());
     }
@@ -71,6 +96,7 @@ class MemoryRedisStore {
   }
 
   async zrem(key: string, ...members: string[]): Promise<number> {
+    this.checkProductionWarning();
     const set = this.zsets.get(key);
     if (!set) return 0;
     let removed = 0;
@@ -81,6 +107,7 @@ class MemoryRedisStore {
   }
 
   async zrange(key: string, min: number | string, max: number | string, opts?: { rev?: boolean }): Promise<string[]> {
+    this.checkProductionWarning();
     const set = this.zsets.get(key);
     if (!set) return [];
     let entries = Array.from(set.entries());
@@ -104,8 +131,6 @@ export interface IRedisClient {
   zrem(key: string, ...members: string[]): Promise<number>;
   zrange(key: string, min: number | string, max: number | string, opts?: { rev?: boolean }): Promise<string[]>;
 }
-
-export const isUpstashConfigured = Boolean(url && token);
 
 export const redis: IRedisClient = isUpstashConfigured
   ? (new Redis({ url: url!, token: token! }) as unknown as IRedisClient)

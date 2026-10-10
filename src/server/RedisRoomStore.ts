@@ -293,6 +293,11 @@ export class RedisRoomStore {
       return { success: false, error: 'Please enter a valid room code' };
     }
 
+    const existingRoom = await this.getRoom(cleanCode);
+    if (!existingRoom) {
+      return { success: false, error: `Room ${cleanCode} not found` };
+    }
+
     return await this.runAtomic<{ success: boolean; room?: GameRoom; error?: string }>(cleanCode, room => {
       const effectiveName =
         (dto.playerName || session.playerName || explicitPlayerName || '').trim().slice(0, 20) ||

@@ -45,8 +45,11 @@ export function useGameSocket() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sessionToken: storedToken, playerName: storedName }),
     })
-      .then(res => res.json())
-      .then(data => {
+      .then(async (res) => {
+        if (!res.ok) return null;
+        return res.json();
+      })
+      .then((data) => {
         if (data?.success) {
           setSessionToken(data.sessionToken);
           sessionTokenRef.current = data.sessionToken;
@@ -79,6 +82,8 @@ export function useGameSocket() {
         if (data.success && data.rooms) {
           setActiveRooms(data.rooms);
         }
+      } else {
+        setRoomsError('Unable to load active rooms');
       }
     } catch {
       setRoomsError('Failed to load active rooms');
@@ -106,8 +111,11 @@ export function useGameSocket() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sessionToken: currentToken, playerName: clean }),
     })
-      .then(res => res.json())
-      .then(data => {
+      .then(async (res) => {
+        if (!res.ok) return null;
+        return res.json();
+      })
+      .then((data) => {
         if (data?.success) {
           setSessionToken(data.sessionToken);
           sessionTokenRef.current = data.sessionToken;
@@ -265,8 +273,8 @@ export function useGameSocket() {
           }),
         });
 
-        const data = await res.json();
-        if (data.success && data.state) {
+        const data = await res.json().catch(() => ({ success: false, error: `Server error (${res.status})` }));
+        if (res.ok && data.success && data.state) {
           if (data.sessionToken) {
             setSessionToken(data.sessionToken);
             sessionTokenRef.current = data.sessionToken;
@@ -278,10 +286,10 @@ export function useGameSocket() {
           setGameState(data.state);
           return { success: true, roomCode: data.roomCode };
         } else {
-          return { success: false, error: data.error || 'Failed to create room' };
+          return { success: false, error: data.error || `Failed to create room (${res.status})` };
         }
       } catch (err: any) {
-        return { success: false, error: err.message || 'Network error' };
+        return { success: false, error: err.message || 'Network error creating room' };
       }
     },
     [playerName]
@@ -315,8 +323,8 @@ export function useGameSocket() {
           }),
         });
 
-        const data = await res.json();
-        if (data.success && data.state) {
+        const data = await res.json().catch(() => ({ success: false, error: `Server error (${res.status})` }));
+        if (res.ok && data.success && data.state) {
           if (data.sessionToken) {
             setSessionToken(data.sessionToken);
             sessionTokenRef.current = data.sessionToken;
@@ -328,10 +336,10 @@ export function useGameSocket() {
           setGameState(data.state);
           return { success: true };
         } else {
-          return { success: false, error: data.error || 'Failed to join room' };
+          return { success: false, error: data.error || `Failed to join room (${res.status})` };
         }
       } catch (err: any) {
-        return { success: false, error: err.message || 'Network error' };
+        return { success: false, error: err.message || 'Network error joining room' };
       }
     },
     [playerName]
@@ -354,8 +362,8 @@ export function useGameSocket() {
           }),
         });
 
-        const data = await res.json();
-        if (data.success) {
+        const data = await res.json().catch(() => ({ success: false, error: `Server error (${res.status})` }));
+        if (res.ok && data.success) {
           if (data.state) {
             setGameState(data.state);
           }
