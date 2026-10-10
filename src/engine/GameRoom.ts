@@ -35,6 +35,7 @@ export class GameRoom {
   public lastRevealedChallenge: RevealedChallengeCard | null = null;
   public eventLogs: GameEventLog[] = [];
   public isResolvingChallenge: boolean = false;
+  public version: number = 1;
   public createdAt: number;
   public updatedAt: number;
 
@@ -453,6 +454,13 @@ export class GameRoom {
     return { success: true };
   }
 
+  public callBluff(
+    challengerId: string,
+    selectedCardId: string
+  ): { success: boolean; error?: string; result?: RevealedChallengeCard } {
+    return this.challengeBluff(challengerId, selectedCardId);
+  }
+
   public challengeBluff(
     challengerId: string,
     selectedCardId: string
@@ -658,7 +666,7 @@ export class GameRoom {
     return this.checkGameOver();
   }
 
-  public resetForRematch(): { success: boolean; error?: string } {
+  public resetForRematch(requestingPlayerId?: string): { success: boolean; error?: string } {
     if (this.status !== 'game_over') {
       return { success: false, error: 'Game is not over' };
     }
@@ -809,5 +817,61 @@ export class GameRoom {
       isSpectator: !!requestingPlayer?.isSpectator,
       activePlayersCount: this.getActivePlayers().length,
     };
+  }
+
+  // --- Serialization for Redis ---
+
+  public toJSON() {
+    return {
+      roomCode: this.roomCode,
+      config: this.config,
+      status: this.status,
+      players: this.players,
+      playerOrder: this.playerOrder,
+      currentTurnIndex: this.currentTurnIndex,
+      activeRank: this.activeRank,
+      lastPlay: this.lastPlay,
+      contributions: this.contributions,
+      blockCards: this.blockCards,
+      lastPlayerToPlayId: this.lastPlayerToPlayId,
+      consecutivePasses: this.consecutivePasses,
+      winnerId: this.winnerId,
+      finishingPositions: this.finishingPositions,
+      lastRevealedChallenge: this.lastRevealedChallenge,
+      eventLogs: this.eventLogs,
+      isResolvingChallenge: this.isResolvingChallenge,
+      version: this.version,
+      createdAt: this.createdAt,
+      updatedAt: this.updatedAt,
+    };
+  }
+
+  public static fromJSON(data: any): GameRoom {
+    if (!data) throw new Error('Cannot create GameRoom from empty data');
+    const room = new GameRoom(data.config || { roomCode: data.roomCode, hostId: '', deckCount: 1, maxPlayers: 6, minPlayers: 2, isPrivate: true });
+    room.roomCode = data.roomCode;
+    room.status = data.status || 'waiting';
+    room.players = (data.players || []).map((p: any) => ({
+      ...p,
+      cards: p.cards || [],
+      isSpectator: !!p.isSpectator,
+    }));
+    room.playerOrder = data.playerOrder || [];
+    room.currentTurnIndex = typeof data.currentTurnIndex === 'number' ? data.currentTurnIndex : 0;
+    room.activeRank = data.activeRank || null;
+    room.lastPlay = data.lastPlay || null;
+    room.contributions = data.contributions || [];
+    room.blockCards = data.blockCards || [];
+    room.lastPlayerToPlayId = data.lastPlayerToPlayId || null;
+    room.consecutivePasses = typeof data.consecutivePasses === 'number' ? data.consecutivePasses : 0;
+    room.winnerId = data.winnerId || null;
+    room.finishingPositions = data.finishingPositions || [];
+    room.lastRevealedChallenge = data.lastRevealedChallenge || null;
+    room.eventLogs = data.eventLogs || [];
+    room.isResolvingChallenge = !!data.isResolvingChallenge;
+    room.version = typeof data.version === 'number' ? data.version : 1;
+    room.createdAt = data.createdAt || Date.now();
+    room.updatedAt = data.updatedAt || Date.now();
+    return room;
   }
 }

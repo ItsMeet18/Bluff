@@ -1,15 +1,13 @@
 'use client';
 
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { io, Socket } from 'socket.io-client';
 import { PublicGameState, Rank, RevealedChallengeCard, ActiveRoomSummary } from '../types/game';
 
 const SESSION_TOKEN_KEY = 'bluff_session_token';
 const PLAYER_NAME_KEY = 'bluff_player_name';
 
 export function useGameSocket() {
-  const [socket, setSocket] = useState<Socket | null>(null);
-  const [isConnected, setIsConnected] = useState<boolean>(false);
+  const [isConnected, setIsConnected] = useState<boolean>(true);
   const [gameState, setGameState] = useState<PublicGameState | null>(null);
   const [playerName, setPlayerNameState] = useState<string>('');
   const [playerId, setPlayerId] = useState<string>('');
@@ -22,7 +20,14 @@ export function useGameSocket() {
 
   const playerNameRef = useRef<string>('');
   const sessionTokenRef = useRef<string>('');
-  const socketRef = useRef<Socket | null>(null);
+  const roomCodeRef = useRef<string | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Keep refs updated
+  useEffect(() => {
+    roomCodeRef.current = gameState?.roomCode || null;
+  }, [gameState?.roomCode]);
 
   // Load stored name, token, and check URL invite on mount
   useEffect(() => {
@@ -34,6 +39,23 @@ export function useGameSocket() {
     setSessionToken(storedToken);
     sessionTokenRef.current = storedToken;
 
+    // Initialize session with backend
+    fetch('/api/auth/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionToken: storedToken, playerName: storedName }),
+    })
+      .then(res => res.json())
+      .then(data => {
+        if (data?.success) {
+          setSessionToken(data.sessionToken);
+          sessionTokenRef.current = data.sessionToken;
+          setPlayerId(data.playerId);
+          localStorage.setItem(SESSION_TOKEN_KEY, data.sessionToken);
+        }
+      })
+      .catch(() => {});
+
     // Check for direct invite parameter in URL (?room=ABC123)
     const urlParams = new URLSearchParams(window.location.search);
     const roomParam = urlParams.get('room');
@@ -43,39 +65,29 @@ export function useGameSocket() {
         setInvitedRoomCode(code);
       }
     }
+
+    fetchActiveRooms();
   }, []);
 
   const fetchActiveRooms = useCallback(async () => {
     setIsLoadingRooms(true);
     setRoomsError(null);
     try {
-      const activeSock = socketRef.current;
-      if (activeSock && activeSock.connected) {
-        activeSock.emit(
-          'get_active_rooms',
-          (res: { success: boolean; rooms?: ActiveRoomSummary[]; error?: string }) => {
-            if (res?.success && res.rooms) {
-              setActiveRooms(res.rooms);
-            }
-            setIsLoadingRooms(false);
-          }
-        );
-      } else {
-        const res = await fetch('/api/rooms');
-        if (res.ok) {
-          const data = await res.json();
-          if (data.success && data.rooms) {
-            setActiveRooms(data.rooms);
-          }
+      const res = await fetch('/api/rooms');
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success && data.rooms) {
+          setActiveRooms(data.rooms);
         }
-        setIsLoadingRooms(false);
       }
     } catch {
       setRoomsError('Failed to load active rooms');
+    } finally {
       setIsLoadingRooms(false);
     }
   }, []);
 
+  // Update player name and sync session
   const setPlayerName = useCallback((name: string) => {
     const clean = name.trim().slice(0, 20);
     setPlayerNameState(clean);
@@ -84,112 +96,148 @@ export function useGameSocket() {
       localStorage.setItem(PLAYER_NAME_KEY, clean);
     }
 
-    // Immediately synchronize session on the server
-    const currentSock = socketRef.current;
-    if (currentSock && currentSock.connected) {
-      const currentToken =
-        sessionTokenRef.current ||
-        (typeof window !== 'undefined' ? localStorage.getItem(SESSION_TOKEN_KEY) : '') ||
-        undefined;
-      currentSock.emit(
-        'auth_session',
-        { sessionToken: currentToken, playerName: clean },
-        (res: { success: boolean; sessionToken: string; playerId: string; playerName: string }) => {
-          if (res?.success) {
-            setSessionToken(res.sessionToken);
-            sessionTokenRef.current = res.sessionToken;
-            setPlayerId(res.playerId);
-            if (typeof window !== 'undefined') {
-              localStorage.setItem(SESSION_TOKEN_KEY, res.sessionToken);
-            }
+    const currentToken =
+      sessionTokenRef.current ||
+      (typeof window !== 'undefined' ? localStorage.getItem(SESSION_TOKEN_KEY) : '') ||
+      undefined;
+
+    fetch('/api/auth/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionToken: currentToken, playerName: clean }),
+    })
+      .then(res => res.json())
+      .then(data => {
+        if (data?.success) {
+          setSessionToken(data.sessionToken);
+          sessionTokenRef.current = data.sessionToken;
+          setPlayerId(data.playerId);
+          if (typeof window !== 'undefined') {
+            localStorage.setItem(SESSION_TOKEN_KEY, data.sessionToken);
           }
         }
-      );
+      })
+      .catch(() => {});
+  }, []);
+
+  // Sync game state from server
+  const syncGameState = useCallback(async (roomCode: string, token: string) => {
+    try {
+      const res = await fetch('/api/game/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomCode, sessionToken: token }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success && data.state) {
+          setGameState(data.state);
+          if (data.state.myPlayerId) {
+            setPlayerId(data.state.myPlayerId);
+          }
+        } else if (data.error === 'Room not found' || data.error === 'Room has expired') {
+          setGameState(null);
+        }
+      }
+    } catch {
+      // Network error, will retry on next interval
     }
   }, []);
 
-  // Initialize Socket connection
+  // Setup WebSocket connection
   useEffect(() => {
-    const newSocket = io({
-      transports: ['websocket', 'polling'],
-      reconnection: true,
-      reconnectionAttempts: 10,
-      reconnectionDelay: 1000,
-    });
+    if (typeof window === 'undefined') return;
 
-    socketRef.current = newSocket;
+    let socket: WebSocket | null = null;
+    let isCleanedUp = false;
 
-    newSocket.on('connect', () => {
-      setIsConnected(true);
-      setErrorMsg(null);
+    const connectWebSocket = () => {
+      if (isCleanedUp) return;
 
-      // Authenticate with server using token and current name
-      const token =
-        sessionTokenRef.current ||
-        (typeof window !== 'undefined' ? localStorage.getItem(SESSION_TOKEN_KEY) : '') ||
-        undefined;
-      const name =
-        playerNameRef.current ||
-        (typeof window !== 'undefined' ? localStorage.getItem(PLAYER_NAME_KEY) : '') ||
-        undefined;
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const host = window.location.host;
+      const roomParam = roomCodeRef.current ? `&roomCode=${roomCodeRef.current}` : '';
+      const tokenParam = sessionTokenRef.current ? `&sessionToken=${sessionTokenRef.current}` : '';
+      const wsUrl = `${protocol}//${host}/api/ws?${roomParam}${tokenParam}`;
 
-      newSocket.emit(
-        'auth_session',
-        { sessionToken: token, playerName: name },
-        (res: { success: boolean; sessionToken: string; playerId: string; playerName: string }) => {
-          if (res?.success) {
-            setSessionToken(res.sessionToken);
-            sessionTokenRef.current = res.sessionToken;
-            setPlayerId(res.playerId);
-            if (typeof window !== 'undefined') {
-              localStorage.setItem(SESSION_TOKEN_KEY, res.sessionToken);
+      try {
+        socket = new WebSocket(wsUrl);
+        wsRef.current = socket;
+
+        socket.onopen = () => {
+          if (isCleanedUp) return;
+          setIsConnected(true);
+          setErrorMsg(null);
+        };
+
+        socket.onmessage = (event) => {
+          try {
+            const msg = JSON.parse(event.data);
+            if (msg.type === 'GAME_STATE_UPDATE' && msg.state) {
+              setGameState(msg.state);
+              if (msg.state.myPlayerId) {
+                setPlayerId(msg.state.myPlayerId);
+              }
+            } else if (msg.type === 'ACTIVE_ROOMS_UPDATE' && msg.rooms) {
+              setActiveRooms(msg.rooms);
             }
+          } catch {
+            // Ignore non-JSON messages
           }
-        }
-      );
+        };
 
-      // Fetch active rooms on connection
-      newSocket.emit('get_active_rooms', (res: { success: boolean; rooms?: ActiveRoomSummary[] }) => {
-        if (res?.success && res.rooms) {
-          setActiveRooms(res.rooms);
-        }
-      });
-    });
+        socket.onclose = () => {
+          if (isCleanedUp) return;
+          // Attempt reconnection after a brief delay
+          reconnectTimeoutRef.current = setTimeout(connectWebSocket, 3000);
+        };
 
-    newSocket.on('disconnect', () => {
-      setIsConnected(false);
-    });
-
-    newSocket.on('game_state_updated', (updatedState: PublicGameState) => {
-      setGameState(updatedState);
-      if (updatedState.myPlayerId) {
-        setPlayerId(updatedState.myPlayerId);
+        socket.onerror = () => {
+          // Socket error, fallback polling handles synchronization
+        };
+      } catch {
+        // Fallback polling handles state
       }
-    });
+    };
 
-    newSocket.on('active_rooms_updated', (rooms: ActiveRoomSummary[]) => {
-      setActiveRooms(rooms);
-    });
-
-    setSocket(newSocket);
+    connectWebSocket();
 
     return () => {
-      newSocket.disconnect();
+      isCleanedUp = true;
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+      }
+      if (socket) {
+        socket.close();
+      }
+      wsRef.current = null;
     };
-  }, []);
+  }, [gameState?.roomCode]);
+
+  // Periodic heartbeat and sync polling to ensure 100% resilient state in serverless environment
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const currentRoom = roomCodeRef.current;
+      const currentToken = sessionTokenRef.current;
+      if (currentRoom && currentToken) {
+        syncGameState(currentRoom, currentToken);
+      } else {
+        fetchActiveRooms();
+      }
+    }, 2000);
+
+    return () => clearInterval(interval);
+  }, [syncGameState, fetchActiveRooms]);
 
   // Actions
   const createRoom = useCallback(
-    (
+    async (
       deckCount: number = 1,
       maxPlayers: number = 6,
       minPlayers: number = 2,
       explicitName?: string
     ): Promise<{ success: boolean; error?: string; roomCode?: string }> => {
-      return new Promise(resolve => {
-        const activeSocket = socketRef.current || socket;
-        if (!activeSocket) return resolve({ success: false, error: 'Connecting to server...' });
-
+      try {
         const nameToSend = (
           explicitName ||
           playerNameRef.current ||
@@ -200,32 +248,48 @@ export function useGameSocket() {
           .trim()
           .slice(0, 20);
 
-        activeSocket.emit(
-          'create_room',
-          { deckCount, maxPlayers, minPlayers, playerName: nameToSend },
-          (res: { success: boolean; roomCode?: string; state?: PublicGameState; error?: string }) => {
-            if (res.success && res.state) {
-              setGameState(res.state);
-              if (res.state.myPlayerId) {
-                setPlayerId(res.state.myPlayerId);
-              }
-              resolve({ success: true, roomCode: res.roomCode });
-            } else {
-              resolve({ success: false, error: res.error || 'Failed to create room' });
-            }
+        const tokenToSend =
+          sessionTokenRef.current ||
+          (typeof window !== 'undefined' ? localStorage.getItem(SESSION_TOKEN_KEY) : '') ||
+          undefined;
+
+        const res = await fetch('/api/game/create', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            deckCount,
+            maxPlayers,
+            minPlayers,
+            playerName: nameToSend,
+            sessionToken: tokenToSend,
+          }),
+        });
+
+        const data = await res.json();
+        if (data.success && data.state) {
+          if (data.sessionToken) {
+            setSessionToken(data.sessionToken);
+            sessionTokenRef.current = data.sessionToken;
+            localStorage.setItem(SESSION_TOKEN_KEY, data.sessionToken);
           }
-        );
-      });
+          if (data.playerId) {
+            setPlayerId(data.playerId);
+          }
+          setGameState(data.state);
+          return { success: true, roomCode: data.roomCode };
+        } else {
+          return { success: false, error: data.error || 'Failed to create room' };
+        }
+      } catch (err: any) {
+        return { success: false, error: err.message || 'Network error' };
+      }
     },
-    [socket, playerName]
+    [playerName]
   );
 
   const joinRoom = useCallback(
-    (roomCode: string, explicitName?: string): Promise<{ success: boolean; error?: string }> => {
-      return new Promise(resolve => {
-        const activeSocket = socketRef.current || socket;
-        if (!activeSocket) return resolve({ success: false, error: 'Connecting to server...' });
-
+    async (roomCode: string, explicitName?: string): Promise<{ success: boolean; error?: string }> => {
+      try {
         const nameToSend = (
           explicitName ||
           playerNameRef.current ||
@@ -236,114 +300,111 @@ export function useGameSocket() {
           .trim()
           .slice(0, 20);
 
-        activeSocket.emit(
-          'join_room',
-          { roomCode: roomCode.trim().toUpperCase(), playerName: nameToSend },
-          (res: { success: boolean; roomCode?: string; state?: PublicGameState; error?: string }) => {
-            if (res.success && res.state) {
-              setGameState(res.state);
-              if (res.state.myPlayerId) {
-                setPlayerId(res.state.myPlayerId);
-              }
-              resolve({ success: true });
-            } else {
-              resolve({ success: false, error: res.error || 'Failed to join room' });
-            }
+        const tokenToSend =
+          sessionTokenRef.current ||
+          (typeof window !== 'undefined' ? localStorage.getItem(SESSION_TOKEN_KEY) : '') ||
+          undefined;
+
+        const res = await fetch('/api/game/join', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            roomCode: roomCode.trim().toUpperCase(),
+            playerName: nameToSend,
+            sessionToken: tokenToSend,
+          }),
+        });
+
+        const data = await res.json();
+        if (data.success && data.state) {
+          if (data.sessionToken) {
+            setSessionToken(data.sessionToken);
+            sessionTokenRef.current = data.sessionToken;
+            localStorage.setItem(SESSION_TOKEN_KEY, data.sessionToken);
           }
-        );
-      });
+          if (data.playerId) {
+            setPlayerId(data.playerId);
+          }
+          setGameState(data.state);
+          return { success: true };
+        } else {
+          return { success: false, error: data.error || 'Failed to join room' };
+        }
+      } catch (err: any) {
+        return { success: false, error: err.message || 'Network error' };
+      }
     },
-    [socket, playerName]
+    [playerName]
+  );
+
+  const performGameAction = useCallback(
+    async (action: any): Promise<{ success: boolean; error?: string; result?: any }> => {
+      if (!gameState || !sessionTokenRef.current) {
+        return { success: false, error: 'Room not loaded or session missing' };
+      }
+
+      try {
+        const res = await fetch('/api/game/action', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            roomCode: gameState.roomCode,
+            sessionToken: sessionTokenRef.current,
+            action,
+          }),
+        });
+
+        const data = await res.json();
+        if (data.success) {
+          if (data.state) {
+            setGameState(data.state);
+          }
+          return { success: true, result: data.result };
+        } else {
+          return { success: false, error: data.error || 'Action failed' };
+        }
+      } catch (err: any) {
+        return { success: false, error: err.message || 'Network error' };
+      }
+    },
+    [gameState]
   );
 
   const startGame = useCallback((): Promise<{ success: boolean; error?: string }> => {
-    return new Promise(resolve => {
-      if (!socket || !gameState) return resolve({ success: false, error: 'Room not loaded' });
-      socket.emit('start_game', { roomCode: gameState.roomCode }, (res: { success: boolean; error?: string }) => {
-        if (res.success) {
-          resolve({ success: true });
-        } else {
-          resolve({ success: false, error: res.error || 'Failed to start game' });
-        }
-      });
-    });
-  }, [socket, gameState]);
+    return performGameAction({ type: 'START_GAME' });
+  }, [performGameAction]);
 
   const playCards = useCallback(
     (cardIds: string[], declaredRank?: Rank): Promise<{ success: boolean; error?: string }> => {
-      return new Promise(resolve => {
-        if (!socket || !gameState) return resolve({ success: false, error: 'Room not loaded' });
-        socket.emit(
-          'play_cards',
-          { roomCode: gameState.roomCode, cardIds, declaredRank },
-          (res: { success: boolean; error?: string }) => {
-            if (res.success) {
-              resolve({ success: true });
-            } else {
-              resolve({ success: false, error: res.error || 'Failed to play cards' });
-            }
-          }
-        );
-      });
+      return performGameAction({ type: 'PLAY_CARDS', cardIds, declaredRank });
     },
-    [socket, gameState]
+    [performGameAction]
   );
 
   const passTurn = useCallback((): Promise<{ success: boolean; error?: string }> => {
-    return new Promise(resolve => {
-      if (!socket || !gameState) return resolve({ success: false, error: 'Room not loaded' });
-      socket.emit('pass_turn', { roomCode: gameState.roomCode }, (res: { success: boolean; error?: string }) => {
-        if (res.success) {
-          resolve({ success: true });
-        } else {
-          resolve({ success: false, error: res.error || 'Failed to pass turn' });
-        }
-      });
-    });
-  }, [socket, gameState]);
+    return performGameAction({ type: 'PASS_TURN' });
+  }, [performGameAction]);
 
   const callBluff = useCallback(
     (selectedCardId: string): Promise<{ success: boolean; error?: string; result?: RevealedChallengeCard }> => {
-      return new Promise(resolve => {
-        if (!socket || !gameState) return resolve({ success: false, error: 'Room not loaded' });
-        socket.emit(
-          'call_bluff',
-          { roomCode: gameState.roomCode, selectedCardId },
-          (res: { success: boolean; error?: string; result?: RevealedChallengeCard }) => {
-            if (res.success) {
-              resolve({ success: true, result: res.result });
-            } else {
-              resolve({ success: false, error: res.error || 'Failed to challenge bluff' });
-            }
-          }
-        );
-      });
+      return performGameAction({ type: 'CALL_BLUFF', selectedCardId });
     },
-    [socket, gameState]
+    [performGameAction]
   );
 
   const playAgain = useCallback((): Promise<{ success: boolean; error?: string }> => {
-    return new Promise(resolve => {
-      if (!socket || !gameState) return resolve({ success: false, error: 'Room not loaded' });
-      socket.emit('play_again', { roomCode: gameState.roomCode }, (res: { success: boolean; error?: string }) => {
-        if (res.success) {
-          resolve({ success: true });
-        } else {
-          resolve({ success: false, error: res.error || 'Failed to reset room' });
-        }
-      });
-    });
-  }, [socket, gameState]);
+    return performGameAction({ type: 'PLAY_AGAIN' });
+  }, [performGameAction]);
 
-  const leaveRoom = useCallback(() => {
-    if (socket && gameState) {
-      socket.emit('leave_room', { roomCode: gameState.roomCode });
+  const leaveRoom = useCallback(async () => {
+    if (gameState && sessionTokenRef.current) {
+      await performGameAction({ type: 'LEAVE_ROOM' });
       setGameState(null);
     }
-  }, [socket, gameState]);
+  }, [gameState, performGameAction]);
 
   return {
-    socket,
+    socket: null,
     isConnected,
     gameState,
     playerId,
