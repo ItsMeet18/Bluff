@@ -4,7 +4,7 @@ import './globals.css';
 export const metadata: Metadata = {
   title: 'BLUFF — Online Multiplayer Card Game',
   description: 'Play your cards. Trust nobody. A fast-paced, real-time multiplayer deception card game.',
-  keywords: ['bluff', 'cheat', 'i doubt it', 'multiplayer card game', 'socket.io card game'],
+  keywords: ['bluff', 'cheat', 'i doubt it', 'multiplayer card game', 'realtime card game'],
   authors: [{ name: 'Bluff Multiplayer Team' }],
 };
 
