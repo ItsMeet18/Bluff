@@ -19,7 +19,7 @@ export async function POST(req: NextRequest) {
     const actionName = (typeof action === 'string' ? action : action?.type || '').toLowerCase();
     const actionPayload = payload || (typeof action === 'object' ? action : {});
 
-    const actionResult = await roomStore.runAtomic(roomCode, room => {
+    const { result, room: updatedRoom } = await roomStore.runAtomic(roomCode, room => {
       const player = room.players.find(p => p.id === playerId);
       if (!player && actionName !== 'leave_room') {
         return { result: { success: false, error: 'Player not in this room' }, changed: false };
@@ -52,7 +52,10 @@ export async function POST(req: NextRequest) {
           if (player?.isSpectator) {
             return { result: { success: false, error: 'Spectators cannot challenge' }, changed: false };
           }
-          const { selectedCardId } = actionPayload;
+          const selectedCardId =
+            actionPayload.selectedCardId ||
+            actionPayload.cardId ||
+            (actionPayload.cardIndex !== undefined ? String(actionPayload.cardIndex) : undefined);
           const res = room.challengeBluff(playerId, selectedCardId);
           return { result: res, changed: res.success };
         }
@@ -78,17 +81,17 @@ export async function POST(req: NextRequest) {
       }
     });
 
-    if (!actionResult.success) {
-      return NextResponse.json({ success: false, error: actionResult.error }, { status: 400 });
+    const actionResult = result as any;
+    if (!actionResult || !actionResult.success) {
+      return NextResponse.json({ success: false, error: actionResult?.error || 'Action failed' }, { status: 400 });
     }
 
-    // Fetch latest state
-    const latestRoom = await roomStore.getRoom(roomCode);
-    const state = latestRoom ? latestRoom.getPublicState(playerId) : null;
+    // Reuse in-memory updatedRoom returned directly from runAtomic without another Redis read!
+    const state = updatedRoom ? updatedRoom.getPublicState(playerId) : null;
 
     return NextResponse.json({
       success: true,
-      result: (actionResult as any).result,
+      result: actionResult.result !== undefined ? actionResult.result : actionResult,
       state,
     });
   } catch (error: any) {

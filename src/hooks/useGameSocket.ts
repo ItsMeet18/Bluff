@@ -21,13 +21,20 @@ export function useGameSocket() {
   const playerNameRef = useRef<string>('');
   const sessionTokenRef = useRef<string>('');
   const roomCodeRef = useRef<string | null>(null);
+  const gameStateRef = useRef<PublicGameState | null>(null);
+  const versionRef = useRef<number | undefined>(undefined);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const pollTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const isSyncingRef = useRef<boolean>(false);
+  const isVisibleRef = useRef<boolean>(true);
 
   // Keep refs updated
   useEffect(() => {
     roomCodeRef.current = gameState?.roomCode || null;
-  }, [gameState?.roomCode]);
+    gameStateRef.current = gameState;
+    versionRef.current = gameState?.version;
+  }, [gameState]);
 
   // Load stored name, token, and check URL invite on mount
   useEffect(() => {
@@ -45,11 +52,11 @@ export function useGameSocket() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sessionToken: storedToken, playerName: storedName }),
     })
-      .then(async (res) => {
+      .then(async res => {
         if (!res.ok) return null;
         return res.json();
       })
-      .then((data) => {
+      .then(data => {
         if (data?.success) {
           setSessionToken(data.sessionToken);
           sessionTokenRef.current = data.sessionToken;
@@ -111,11 +118,11 @@ export function useGameSocket() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sessionToken: currentToken, playerName: clean }),
     })
-      .then(async (res) => {
+      .then(async res => {
         if (!res.ok) return null;
         return res.json();
       })
-      .then((data) => {
+      .then(data => {
         if (data?.success) {
           setSessionToken(data.sessionToken);
           sessionTokenRef.current = data.sessionToken;
@@ -128,27 +135,36 @@ export function useGameSocket() {
       .catch(() => {});
   }, []);
 
-  // Sync game state from server
+  // Sync game state from server with version check and in-flight deduplication
   const syncGameState = useCallback(async (roomCode: string, token: string) => {
+    if (isSyncingRef.current) return;
+    isSyncingRef.current = true;
+
     try {
-      const res = await fetch('/api/game/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roomCode, sessionToken: token }),
-      });
+      const currentVersion = versionRef.current;
+      const vQuery = currentVersion !== undefined ? `&v=${currentVersion}` : '';
+      const res = await fetch(`/api/game/sync?roomCode=${roomCode}&sessionToken=${token}${vQuery}`);
+
       if (res.ok) {
         const data = await res.json();
-        if (data.success && data.state) {
-          setGameState(data.state);
-          if (data.state.myPlayerId) {
-            setPlayerId(data.state.myPlayerId);
+        if (data.success) {
+          if (data.notModified) {
+            // State is already identical on server; skip state update and re-render
+          } else if (data.state) {
+            setGameState(data.state);
+            versionRef.current = data.state.version;
+            if (data.state.myPlayerId) {
+              setPlayerId(data.state.myPlayerId);
+            }
           }
         } else if (data.error === 'Room not found' || data.error === 'Room has expired') {
           setGameState(null);
         }
       }
     } catch {
-      // Network error, will retry on next interval
+      // Network error, will retry on next schedule
+    } finally {
+      isSyncingRef.current = false;
     }
   }, []);
 
@@ -178,11 +194,12 @@ export function useGameSocket() {
           setErrorMsg(null);
         };
 
-        socket.onmessage = (event) => {
+        socket.onmessage = event => {
           try {
             const msg = JSON.parse(event.data);
             if (msg.type === 'GAME_STATE_UPDATE' && msg.state) {
               setGameState(msg.state);
+              versionRef.current = msg.state.version;
               if (msg.state.myPlayerId) {
                 setPlayerId(msg.state.myPlayerId);
               }
@@ -196,8 +213,7 @@ export function useGameSocket() {
 
         socket.onclose = () => {
           if (isCleanedUp) return;
-          // Attempt reconnection after a brief delay
-          reconnectTimeoutRef.current = setTimeout(connectWebSocket, 3000);
+          reconnectTimeoutRef.current = setTimeout(connectWebSocket, 4000);
         };
 
         socket.onerror = () => {
@@ -222,19 +238,75 @@ export function useGameSocket() {
     };
   }, [gameState?.roomCode]);
 
-  // Periodic heartbeat and sync polling to ensure 100% resilient state in serverless environment
+  // Visibility-Aware & Adaptive Polling to drastically reduce Redis command usage
   useEffect(() => {
-    const interval = setInterval(() => {
+    if (typeof window === 'undefined' || typeof document === 'undefined') return;
+
+    let isDestroyed = false;
+
+    const onVisibilityChange = () => {
+      const visible = !document.hidden;
+      isVisibleRef.current = visible;
+      if (visible) {
+        // Immediate sync when tab becomes visible again
+        const currentRoom = roomCodeRef.current;
+        const currentToken = sessionTokenRef.current;
+        if (currentRoom && currentToken) {
+          syncGameState(currentRoom, currentToken);
+        } else {
+          fetchActiveRooms();
+        }
+      }
+    };
+
+    document.addEventListener('visibilitychange', onVisibilityChange);
+
+    const getNextInterval = () => {
+      if (!isVisibleRef.current) {
+        return 30_000; // 30s heartbeat when tab is hidden/minimized
+      }
+      if (!roomCodeRef.current) {
+        return 6_000; // 6s in lobby
+      }
+      const state = gameStateRef.current;
+      if (state?.status === 'waiting') {
+        return 3_000; // 3s in waiting room
+      }
+      if (state?.status === 'game_over') {
+        return 4_000; // 4s on match complete
+      }
+      if (state?.isMyTurn) {
+        return 4_000; // 4s when current player is thinking
+      }
+      return 2_500; // 2.5s active gameplay when waiting for opponent move
+    };
+
+    const runPollLoop = async () => {
+      if (isDestroyed) return;
+
       const currentRoom = roomCodeRef.current;
       const currentToken = sessionTokenRef.current;
-      if (currentRoom && currentToken) {
-        syncGameState(currentRoom, currentToken);
-      } else {
-        fetchActiveRooms();
-      }
-    }, 2000);
 
-    return () => clearInterval(interval);
+      if (currentRoom && currentToken) {
+        await syncGameState(currentRoom, currentToken);
+      } else {
+        await fetchActiveRooms();
+      }
+
+      if (!isDestroyed) {
+        pollTimerRef.current = setTimeout(runPollLoop, getNextInterval());
+      }
+    };
+
+    pollTimerRef.current = setTimeout(runPollLoop, getNextInterval());
+
+    return () => {
+      isDestroyed = true;
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      if (pollTimerRef.current) {
+        clearTimeout(pollTimerRef.current);
+      }
+    };
   }, [syncGameState, fetchActiveRooms]);
 
   // Actions
@@ -284,6 +356,7 @@ export function useGameSocket() {
             setPlayerId(data.playerId);
           }
           setGameState(data.state);
+          versionRef.current = data.state.version;
           return { success: true, roomCode: data.roomCode };
         } else {
           return { success: false, error: data.error || `Failed to create room (${res.status})` };
@@ -334,6 +407,7 @@ export function useGameSocket() {
             setPlayerId(data.playerId);
           }
           setGameState(data.state);
+          versionRef.current = data.state.version;
           return { success: true };
         } else {
           return { success: false, error: data.error || `Failed to join room (${res.status})` };
@@ -366,6 +440,7 @@ export function useGameSocket() {
         if (res.ok && data.success) {
           if (data.state) {
             setGameState(data.state);
+            versionRef.current = data.state.version;
           }
           return { success: true, result: data.result };
         } else {
@@ -408,6 +483,7 @@ export function useGameSocket() {
     if (gameState && sessionTokenRef.current) {
       await performGameAction({ type: 'LEAVE_ROOM' });
       setGameState(null);
+      versionRef.current = undefined;
     }
   }, [gameState, performGameAction]);
 

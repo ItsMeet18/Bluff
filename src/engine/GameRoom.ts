@@ -822,6 +822,7 @@ export class GameRoom {
       myPlayerId: requestingPlayerId || '',
       isSpectator: !!requestingPlayer?.isSpectator,
       activePlayersCount: this.getActivePlayers().length,
+      version: this.version,
     };
   }
 

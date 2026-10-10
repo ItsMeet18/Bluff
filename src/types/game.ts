@@ -165,6 +165,7 @@ export interface PublicGameState {
   myPlayerId: string;
   isSpectator: boolean;
   activePlayersCount: number;
+  version?: number;
 }
 
 export interface CreateRoomDto {

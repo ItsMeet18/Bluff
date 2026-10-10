@@ -13,6 +13,9 @@ const LOCK_TTL_SECONDS = 5; // 5 seconds distributed lock
 
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 
+const UNLOCK_SCRIPT =
+  'if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end';
+
 export interface UserSession {
   token: string;
   sessionToken: string;
@@ -32,9 +35,21 @@ export interface CreateRoomDto {
 export interface JoinRoomDto {
   roomCode: string;
   playerName?: string;
+  sessionToken?: string;
+}
+
+export interface AtomicExecutionResult<T> {
+  result: T;
+  room?: GameRoom;
 }
 
 export class RedisRoomStore {
+  // In-process short-lived caches to eliminate redundant reads on warm serverless instances
+  private sessionCache = new Map<string, { session: UserSession; cachedAt: number }>();
+  private activeRoomsCache: { rooms: ActiveRoomSummary[]; cachedAt: number } | null = null;
+  private readonly SESSION_CACHE_TTL_MS = 45_000; // 45 seconds
+  private readonly ACTIVE_ROOMS_CACHE_TTL_MS = 3_000; // 3 seconds
+
   private roomKey(code: string): string {
     return `${ROOM_PREFIX}${code.toUpperCase()}`;
   }
@@ -54,11 +69,13 @@ export class RedisRoomStore {
   // --- Session Management ---
 
   public async getOrCreateSession(token?: string, requestedName?: string): Promise<UserSession> {
+    const cleanRequestedName = requestedName?.trim().slice(0, 20);
+
     if (token) {
       const existing = await this.getSession(token);
       if (existing) {
-        if (requestedName && requestedName.trim()) {
-          existing.playerName = requestedName.trim().slice(0, 20);
+        if (cleanRequestedName && existing.playerName !== cleanRequestedName) {
+          existing.playerName = cleanRequestedName;
           await this.saveSession(existing);
         }
         return existing;
@@ -67,7 +84,7 @@ export class RedisRoomStore {
 
     const generatedToken = `sess_${Date.now()}_${Math.random().toString(36).substring(2, 12)}`;
     const playerId = `usr_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
-    const playerName = requestedName?.trim().slice(0, 20) || `Player_${playerId.slice(-4)}`;
+    const playerName = cleanRequestedName || `Player_${playerId.slice(-4)}`;
 
     const session: UserSession = {
       token: generatedToken,
@@ -77,15 +94,25 @@ export class RedisRoomStore {
       lastActive: Date.now(),
     };
 
-    await redis.set(this.sessionKey(generatedToken), session, { ex: SESSION_TTL_SECONDS });
+    await this.saveSession(session);
     return session;
   }
 
   public async getSession(token: string): Promise<UserSession | null> {
     if (!token) return null;
+
+    // Check in-process cache first
+    const cached = this.sessionCache.get(token);
+    if (cached && Date.now() - cached.cachedAt < this.SESSION_CACHE_TTL_MS) {
+      return cached.session;
+    }
+
     const session = await redis.get<UserSession>(this.sessionKey(token));
-    if (session && !session.sessionToken && session.token) {
-      session.sessionToken = session.token;
+    if (session) {
+      if (!session.sessionToken && session.token) {
+        session.sessionToken = session.token;
+      }
+      this.sessionCache.set(token, { session, cachedAt: Date.now() });
     }
     return session;
   }
@@ -98,6 +125,8 @@ export class RedisRoomStore {
     if (!session.token && session.sessionToken) {
       session.token = session.sessionToken;
     }
+
+    this.sessionCache.set(session.token, { session, cachedAt: Date.now() });
     await redis.set(this.sessionKey(session.token), session, { ex: SESSION_TTL_SECONDS });
   }
 
@@ -134,21 +163,30 @@ export class RedisRoomStore {
     }
   }
 
-  public async saveRoom(room: GameRoom): Promise<void> {
+  public async saveRoom(room: GameRoom, previousStatus?: string): Promise<void> {
     room.updatedAt = Date.now();
     const cleanCode = room.roomCode.toUpperCase();
     await redis.set(this.roomKey(cleanCode), room.toJSON(), { ex: ROOM_TTL_SECONDS });
 
-    // Update active rooms index
-    if (room.status === 'waiting' && room.players.length < room.config.maxPlayers) {
+    // Invalidate active rooms in-process cache
+    this.activeRoomsCache = null;
+
+    // Only update activeRooms sorted set if the room is waiting or its waiting status changed
+    const isCurrentlyWaiting = room.status === 'waiting' && room.players.length < room.config.maxPlayers;
+    const wasWaiting = !previousStatus || previousStatus === 'waiting';
+
+    if (isCurrentlyWaiting) {
       await redis.zadd(this.activeRoomsKey(), { score: room.createdAt, member: cleanCode });
-    } else {
+    } else if (wasWaiting) {
+      // Room was waiting and is now no longer waiting (started or full) -> remove once
       await redis.zrem(this.activeRoomsKey(), cleanCode);
     }
+    // If the room was already in_progress and remains in_progress, skip calling zrem!
   }
 
   public async deleteRoom(roomCode: string): Promise<void> {
     const cleanCode = roomCode.trim().toUpperCase();
+    this.activeRoomsCache = null;
     await redis.del(this.roomKey(cleanCode));
     await redis.zrem(this.activeRoomsKey(), cleanCode);
   }
@@ -159,7 +197,7 @@ export class RedisRoomStore {
     roomCode: string,
     mutator: (room: GameRoom) => Promise<{ result?: T; changed?: boolean } | T | void> | { result?: T; changed?: boolean } | T | void,
     options: { maxRetries?: number; retryDelayMs?: number } = {}
-  ): Promise<T> {
+  ): Promise<AtomicExecutionResult<T>> {
     const cleanCode = roomCode.trim().toUpperCase();
     const lockKey = this.lockKey(cleanCode);
     const lockValue = `${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
@@ -181,13 +219,15 @@ export class RedisRoomStore {
       throw new Error(`Unable to acquire lock for room ${cleanCode}. Please try again.`);
     }
 
+    let loadedRoom: GameRoom | null = null;
     try {
-      const room = await this.getRoom(cleanCode);
-      if (!room) {
+      loadedRoom = await this.getRoom(cleanCode);
+      if (!loadedRoom) {
         throw new Error(`Room ${cleanCode} does not exist`);
       }
 
-      const mutatorOutput = await mutator(room);
+      const previousStatus = loadedRoom.status;
+      const mutatorOutput = await mutator(loadedRoom);
       let result: T;
       let changed = true;
 
@@ -204,20 +244,22 @@ export class RedisRoomStore {
       }
 
       if (changed) {
-        room.version = (room.version || 0) + 1;
-        await this.saveRoom(room);
+        loadedRoom.version = (loadedRoom.version || 0) + 1;
+        await this.saveRoom(loadedRoom, previousStatus);
       }
 
-      return result;
+      return { result, room: loadedRoom };
     } finally {
-      // Release lock only if we still hold it
+      // Release lock atomically in a single Redis command using Lua script
       try {
-        const currentLock = await redis.get(lockKey);
-        if (currentLock === lockValue) {
-          await redis.del(lockKey);
-        }
+        await redis.eval(UNLOCK_SCRIPT, [lockKey], [lockValue]);
       } catch {
-        // Ignore lock release errors
+        // Fallback to delete if eval fails
+        try {
+          await redis.del(lockKey);
+        } catch {
+          // Ignore unlock errors
+        }
       }
     }
   }
@@ -293,52 +335,87 @@ export class RedisRoomStore {
       return { success: false, error: 'Please enter a valid room code' };
     }
 
-    const existingRoom = await this.getRoom(cleanCode);
-    if (!existingRoom) {
-      return { success: false, error: `Room ${cleanCode} not found` };
-    }
+    // Atomic join without redundant pre-lock getRoom read
+    try {
+      const atomicOutput = await this.runAtomic<{ success: boolean; room?: GameRoom; error?: string }>(
+        cleanCode,
+        room => {
+          const effectiveName =
+            (dto.playerName || session.playerName || explicitPlayerName || '').trim().slice(0, 20) ||
+            `Player_${session.playerId.slice(-4)}`;
+          session.playerName = effectiveName;
 
-    return await this.runAtomic<{ success: boolean; room?: GameRoom; error?: string }>(cleanCode, room => {
-      const effectiveName =
-        (dto.playerName || session.playerName || explicitPlayerName || '').trim().slice(0, 20) ||
-        `Player_${session.playerId.slice(-4)}`;
-      session.playerName = effectiveName;
-
-      if (room.status !== 'waiting') {
-        const existingPlayer = room.players.find(p => p.id === session.playerId);
-        if (existingPlayer) {
-          if (dto.playerName && dto.playerName.trim()) {
-            existingPlayer.name = effectiveName;
+          if (room.status !== 'waiting') {
+            const existingPlayer = room.players.find(p => p.id === session.playerId);
+            if (existingPlayer) {
+              if (dto.playerName && dto.playerName.trim()) {
+                existingPlayer.name = effectiveName;
+              }
+              existingPlayer.isConnected = true;
+              session.roomCode = cleanCode;
+              return { result: { success: true, room }, changed: true };
+            }
+            return { result: { success: false, error: 'Game has already started in this room' }, changed: false };
           }
-          existingPlayer.isConnected = true;
+
+          const joinResult = room.addPlayer(session.playerId, effectiveName);
+          if (!joinResult.success) {
+            return { result: { success: false, error: joinResult.error }, changed: false };
+          }
+
           session.roomCode = cleanCode;
           return { result: { success: true, room }, changed: true };
         }
-        return { result: { success: false, error: 'Game has already started in this room' }, changed: false };
-      }
+      );
 
-      const joinResult = room.addPlayer(session.playerId, effectiveName);
-      if (!joinResult.success) {
-        return { result: { success: false, error: joinResult.error }, changed: false };
-      }
-
-      session.roomCode = cleanCode;
-      return { result: { success: true, room }, changed: true };
-    }).then(async res => {
+      const res = atomicOutput.result;
       if (res && res.success) {
-        await this.saveSession(session);
+        if (session.roomCode !== cleanCode) {
+          session.roomCode = cleanCode;
+          await this.saveSession(session);
+        }
       }
       return res;
-    });
+    } catch (err: any) {
+      if (err.message && err.message.includes('does not exist')) {
+        return { success: false, error: `Room ${cleanCode} not found` };
+      }
+      return { success: false, error: err.message || 'Failed to join room' };
+    }
   }
 
   public async getActiveRooms(): Promise<ActiveRoomSummary[]> {
+    // Return in-process cached active rooms if within 3-second window
+    if (this.activeRoomsCache && Date.now() - this.activeRoomsCache.cachedAt < this.ACTIVE_ROOMS_CACHE_TTL_MS) {
+      return this.activeRoomsCache.rooms;
+    }
+
     const codes = await redis.zrange(this.activeRoomsKey(), 0, -1, { rev: true });
-    if (!codes || codes.length === 0) return [];
+    if (!codes || codes.length === 0) {
+      this.activeRoomsCache = { rooms: [], cachedAt: Date.now() };
+      return [];
+    }
+
+    // Batch fetch all room keys in a SINGLE mget command instead of N get commands
+    const roomKeys = codes.map(code => this.roomKey(code));
+    const rawRooms = await redis.mget(...roomKeys);
 
     const list: ActiveRoomSummary[] = [];
-    for (const code of codes) {
-      const room = await this.getRoom(code);
+    const staleCodes: string[] = [];
+
+    for (let i = 0; i < codes.length; i++) {
+      const code = codes[i];
+      const raw = rawRooms[i];
+      let room: GameRoom | null = null;
+      if (raw) {
+        try {
+          const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+          room = GameRoom.fromJSON(parsed);
+        } catch {
+          room = null;
+        }
+      }
+
       if (room && room.status === 'waiting' && room.players.length < room.config.maxPlayers) {
         const host = room.players.find(p => p.id === room.config.hostId) || room.players[0];
         list.push({
@@ -350,12 +427,17 @@ export class RedisRoomStore {
           status: 'waiting',
           createdAt: room.createdAt,
         });
-      } else if (!room || room.status !== 'waiting' || room.players.length >= room.config.maxPlayers) {
-        // Clean up stale entry
-        await redis.zrem(this.activeRoomsKey(), code);
+      } else {
+        staleCodes.push(code);
       }
     }
 
+    // Clean up stale entries if any were found
+    if (staleCodes.length > 0) {
+      await redis.zrem(this.activeRoomsKey(), ...staleCodes);
+    }
+
+    this.activeRoomsCache = { rooms: list, cachedAt: Date.now() };
     return list;
   }
 }
