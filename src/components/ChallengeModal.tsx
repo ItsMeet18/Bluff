@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Contribution, RANK_NAMES, RANK_SINGULAR_NAMES } from '../types/game';
 import { CardView } from './CardView';
 import { ShieldAlert, AlertTriangle, X, Eye } from 'lucide-react';
@@ -22,18 +22,36 @@ export const ChallengeModal: React.FC<ChallengeModalProps> = ({
   onConfirmChallenge,
   isLoading = false,
 }) => {
-  const [selectedCardId, setSelectedCardId] = useState<string | null>(
-    lastPlay.cardIds[0] || null
-  );
+  // Initialize to null: NO card is automatically selected when the interface opens
+  const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
   const [confirmed, setConfirmed] = useState<boolean>(false);
+  const lastPlayIdRef = useRef<string | null>(null);
+  const prevIsOpenRef = useRef<boolean>(false);
 
-  // Update default selected card if lastPlay changes
+  // Manage selection lifecycle strictly on modal open/close or when challenged play changes
   useEffect(() => {
-    if (lastPlay.cardIds.length > 0) {
-      setSelectedCardId(lastPlay.cardIds[0]);
+    if (isOpen) {
+      const isNewOpen = !prevIsOpenRef.current;
+      const isNewPlay = lastPlay.id !== lastPlayIdRef.current;
+
+      // Only reset selection if the modal just opened or a brand new play is being challenged
+      if (isNewOpen || isNewPlay) {
+        setSelectedCardId(null);
+        setConfirmed(false);
+        lastPlayIdRef.current = lastPlay.id;
+      } else if (selectedCardId && !lastPlay.cardIds.includes(selectedCardId)) {
+        // Fallback: If selected card no longer exists in current play
+        setSelectedCardId(null);
+        setConfirmed(false);
+      }
+    } else {
+      // Clear selection when modal is closed
+      setSelectedCardId(null);
       setConfirmed(false);
+      lastPlayIdRef.current = null;
     }
-  }, [lastPlay]);
+    prevIsOpenRef.current = isOpen;
+  }, [isOpen, lastPlay.id, lastPlay.cardIds, selectedCardId]);
 
   // Lock body scroll when modal is open
   useEffect(() => {
@@ -48,7 +66,7 @@ export const ChallengeModal: React.FC<ChallengeModalProps> = ({
 
   if (!isOpen) return null;
 
-  const selectedCardIndex = lastPlay.cardIds.indexOf(selectedCardId || '');
+  const selectedCardIndex = selectedCardId ? lastPlay.cardIds.indexOf(selectedCardId) : -1;
 
   const handleExecute = () => {
     if (!selectedCardId || !confirmed || isLoading) return;
@@ -87,7 +105,7 @@ export const ChallengeModal: React.FC<ChallengeModalProps> = ({
           <div className="mt-3 p-2.5 sm:p-3 rounded-xl bg-slate-950/80 border border-slate-800/80 text-xs text-slate-300 leading-relaxed flex items-center gap-2">
             <Eye className="w-4 h-4 text-amber-400 shrink-0" />
             <span>
-              Select <b>ONE card</b> below from {lastPlay.playerName}&apos;s play of {lastPlay.cardCount} card{lastPlay.cardCount > 1 ? 's' : ''} to reveal and inspect:
+              Click <b>ONE card</b> below from {lastPlay.playerName}&apos;s play of {lastPlay.cardCount} card{lastPlay.cardCount > 1 ? 's' : ''} to reveal and inspect:
             </span>
           </div>
         </div>
@@ -103,14 +121,15 @@ export const ChallengeModal: React.FC<ChallengeModalProps> = ({
                   <button
                     type="button"
                     key={cardId}
+                    id={`bluff-card-option-${index}`}
                     onClick={() => {
                       setSelectedCardId(cardId);
                       setConfirmed(false);
                     }}
                     className={`flex flex-col items-center gap-1.5 p-2 rounded-xl transition-all w-full focus:outline-none ${
                       isPicked
-                        ? 'bg-amber-500/15 ring-2 ring-amber-400 rounded-xl scale-105'
-                        : 'hover:bg-slate-800/60 opacity-85 hover:opacity-100'
+                        ? 'bg-amber-500/20 ring-2 ring-amber-400 rounded-xl scale-105 shadow-glow-gold'
+                        : 'hover:bg-slate-800/60 opacity-80 hover:opacity-100 border border-transparent hover:border-slate-700/50'
                     }`}
                   >
                     <CardView
@@ -139,10 +158,10 @@ export const ChallengeModal: React.FC<ChallengeModalProps> = ({
               <span>Resolution Stakes ({totalBlockCards} Cards in Central Block)</span>
             </div>
             <p className="leading-snug">
-              • If Card #{selectedCardIndex + 1} is <span className="text-rose-400 font-bold">NOT a {RANK_SINGULAR_NAMES[lastPlay.declaredRank]}</span>: Bluff caught! <span className="font-bold text-emerald-400">{lastPlay.playerName}</span> collects all {totalBlockCards} cards.
+              • If {selectedCardId ? <span className="font-bold text-white">Card #{selectedCardIndex + 1}</span> : 'the chosen card'} is <span className="text-rose-400 font-bold">NOT a {RANK_SINGULAR_NAMES[lastPlay.declaredRank]}</span>: Bluff caught! <span className="font-bold text-emerald-400">{lastPlay.playerName}</span> collects all {totalBlockCards} cards.
             </p>
             <p className="leading-snug">
-              • If Card #{selectedCardIndex + 1} <span className="text-emerald-400 font-bold">IS a {RANK_SINGULAR_NAMES[lastPlay.declaredRank]}</span>: Truthful play! <span className="font-bold text-rose-400">YOU</span> collect all {totalBlockCards} cards.
+              • If {selectedCardId ? <span className="font-bold text-white">Card #{selectedCardIndex + 1}</span> : 'the chosen card'} <span className="text-emerald-400 font-bold">IS a {RANK_SINGULAR_NAMES[lastPlay.declaredRank]}</span>: Truthful play! <span className="font-bold text-rose-400">YOU</span> collect all {totalBlockCards} cards.
             </p>
           </div>
         </div>
@@ -155,11 +174,23 @@ export const ChallengeModal: React.FC<ChallengeModalProps> = ({
               type="checkbox"
               id="confirmBluffCheck"
               checked={confirmed}
+              disabled={!selectedCardId || isLoading}
               onChange={e => setConfirmed(e.target.checked)}
-              className="w-4 h-4 accent-amber-500 rounded cursor-pointer shrink-0"
+              className="w-4 h-4 accent-amber-500 rounded cursor-pointer shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
             />
-            <label htmlFor="confirmBluffCheck" className="text-xs font-semibold text-slate-200 cursor-pointer select-none">
-              I confirm calling bluff on <span className="text-amber-400 font-bold">Card #{selectedCardIndex + 1}</span>
+            <label
+              htmlFor="confirmBluffCheck"
+              className={`text-xs font-semibold select-none ${
+                selectedCardId ? 'text-slate-200 cursor-pointer' : 'text-slate-500 cursor-not-allowed'
+              }`}
+            >
+              {selectedCardId ? (
+                <>
+                  I confirm calling bluff on <span className="text-amber-400 font-bold">Card #{selectedCardIndex + 1}</span>
+                </>
+              ) : (
+                <>Select a card above to confirm challenge</>
+              )}
             </label>
           </div>
 
@@ -177,7 +208,13 @@ export const ChallengeModal: React.FC<ChallengeModalProps> = ({
               disabled={!selectedCardId || !confirmed || isLoading}
               className="flex-1 py-2.5 sm:py-3 px-4 rounded-xl font-bold text-white bg-gradient-to-r from-rose-600 to-rose-700 hover:from-rose-500 hover:to-rose-600 shadow-glow-red transition-all text-xs sm:text-sm disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2"
             >
-              {isLoading ? 'Revealing...' : 'Reveal & Challenge!'}
+              {isLoading
+                ? 'Revealing...'
+                : !selectedCardId
+                ? 'Select a Card'
+                : !confirmed
+                ? 'Confirm Selection'
+                : 'Reveal & Challenge!'}
             </button>
           </div>
         </div>

@@ -490,8 +490,14 @@ export class GameRoom {
       return { success: false, error: 'You cannot challenge your own play' };
     }
 
-    // Find the selected card in the last play
-    const targetCard = this.lastPlay.cards.find(c => c.id === selectedCardId);
+    // Find the selected card in the last play (by ID or scoped index)
+    let targetCard = this.lastPlay.cards.find(c => c.id === selectedCardId);
+    if (!targetCard && typeof selectedCardId === 'string' && /^\d+$/.test(selectedCardId)) {
+      const idx = parseInt(selectedCardId, 10);
+      if (idx >= 0 && idx < this.lastPlay.cards.length) {
+        targetCard = this.lastPlay.cards[idx];
+      }
+    }
     if (!targetCard) {
       return { success: false, error: 'Selected card does not belong to the most recent play' };
     }
