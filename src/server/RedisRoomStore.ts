@@ -391,10 +391,8 @@ export class RedisRoomStore {
 
       const res = atomicOutput.result;
       if (res && res.success) {
-        if (session.roomCode !== cleanCode) {
-          session.roomCode = cleanCode;
-          await this.saveSession(session);
-        }
+        session.roomCode = cleanCode;
+        await this.saveSession(session);
       }
       return res;
     } catch (err: any) {

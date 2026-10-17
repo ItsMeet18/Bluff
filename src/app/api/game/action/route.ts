@@ -103,6 +103,16 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ success: false, error: actionResult?.error || 'Action failed' }, { status: 400 });
     }
 
+    if (actionName === 'leave_room') {
+      if (session.roomCode) {
+        session.roomCode = undefined;
+        await roomStore.saveSession(session);
+      }
+      if (actionResult.roomEmpty) {
+        await roomStore.deleteRoom(roomCode);
+      }
+    }
+
     // Reuse in-memory updatedRoom returned directly from runAtomic without another Redis read!
     const state = updatedRoom ? updatedRoom.getPublicState(playerId) : null;
 

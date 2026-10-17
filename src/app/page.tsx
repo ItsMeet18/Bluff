@@ -8,16 +8,20 @@ import { LandingView } from '../components/LandingView';
 import { LobbyView } from '../components/LobbyView';
 import { WaitingRoomView } from '../components/WaitingRoomView';
 import { GameTable } from '../components/GameTable';
+import { AlertCircle } from 'lucide-react';
 
 export default function BluffApp() {
   const {
     isConnected,
+    isRestoringSession,
     gameState,
     playerId,
     playerName,
     setPlayerName,
     invitedRoomCode,
     setInvitedRoomCode,
+    errorMsg,
+    setErrorMsg,
     activeRooms,
     isLoadingRooms,
     roomsError,
@@ -56,9 +60,9 @@ export default function BluffApp() {
     }
   }, [playerName]);
 
-  // If user ALREADY had a name stored and lands on invite link (?room=XYZ), auto-join once socket is connected
+  // If user ALREADY had a name stored and lands on invite link (?room=XYZ), auto-join once socket is connected and session restored
   useEffect(() => {
-    if (isConnected && playerName && invitedRoomCode && !gameState && !autoJoinAttempted.current) {
+    if (!isRestoringSession && isConnected && playerName && invitedRoomCode && !gameState && !autoJoinAttempted.current) {
       autoJoinAttempted.current = true;
       joinRoom(invitedRoomCode, playerName).then(res => {
         if (!res.success) {
@@ -67,7 +71,7 @@ export default function BluffApp() {
         }
       });
     }
-  }, [isConnected, playerName, invitedRoomCode, gameState, joinRoom, setInvitedRoomCode]);
+  }, [isRestoringSession, isConnected, playerName, invitedRoomCode, gameState, joinRoom, setInvitedRoomCode]);
 
   // Audio trigger effects when game state changes
   useEffect(() => {
@@ -177,17 +181,39 @@ export default function BluffApp() {
             invitedRoomCode={invitedRoomCode}
             inviteError={inviteError}
           />
+        ) : isRestoringSession ? (
+          <div className="flex-1 flex flex-col items-center justify-center p-6 text-center animate-fade-in">
+            <div className="relative mb-6">
+              <div className="w-16 h-16 rounded-2xl bg-indigo-600/20 border border-indigo-500/30 flex items-center justify-center shadow-lg shadow-indigo-500/10 backdrop-blur-sm">
+                <div className="w-8 h-8 border-2 border-indigo-400 border-t-transparent rounded-full animate-spin" />
+              </div>
+            </div>
+            <h2 className="text-xl font-bold text-white mb-2 tracking-wide">
+              Reconnecting to game...
+            </h2>
+            <p className="text-sm text-slate-400 max-w-sm">
+              Restoring your room session and cards. Hang tight!
+            </p>
+          </div>
         ) : !gameState ? (
-          <LobbyView
-            playerName={playerName}
-            onCreateRoom={handleCreateRoom}
-            onJoinRoom={handleJoinRoom}
-            onBack={handleChangeName}
-            activeRooms={activeRooms}
-            isLoadingRooms={isLoadingRooms}
-            roomsError={roomsError}
-            onRefreshRooms={fetchActiveRooms}
-          />
+          <div className="flex-1 flex flex-col">
+            {errorMsg && (
+              <div className="max-w-md mx-auto mt-4 px-4 py-3 bg-rose-500/10 border border-rose-500/20 text-rose-400 rounded-xl text-sm flex items-center gap-2">
+                <AlertCircle className="w-5 h-5 flex-shrink-0" />
+                <span>{errorMsg}</span>
+              </div>
+            )}
+            <LobbyView
+              playerName={playerName}
+              onCreateRoom={handleCreateRoom}
+              onJoinRoom={handleJoinRoom}
+              onBack={handleChangeName}
+              activeRooms={activeRooms}
+              isLoadingRooms={isLoadingRooms}
+              roomsError={roomsError}
+              onRefreshRooms={fetchActiveRooms}
+            />
+          </div>
         ) : gameState.status === 'waiting' ? (
           <WaitingRoomView
             gameState={gameState}

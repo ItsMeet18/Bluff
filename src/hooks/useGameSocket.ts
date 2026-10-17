@@ -5,6 +5,8 @@ import { PublicGameState, Rank, RevealedChallengeCard, ActiveRoomSummary } from 
 
 const SESSION_TOKEN_KEY = 'bluff_session_token';
 const PLAYER_NAME_KEY = 'bluff_player_name';
+const ROOM_CODE_KEY = 'bluff_room_code';
+const PLAYER_ID_KEY = 'bluff_player_id';
 
 export function useGameSocket() {
   const [isConnected, setIsConnected] = useState<boolean>(true);
@@ -17,6 +19,12 @@ export function useGameSocket() {
   const [activeRooms, setActiveRooms] = useState<ActiveRoomSummary[]>([]);
   const [isLoadingRooms, setIsLoadingRooms] = useState<boolean>(false);
   const [roomsError, setRoomsError] = useState<string | null>(null);
+  const [isRestoringSession, setIsRestoringSession] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    const token = localStorage.getItem(SESSION_TOKEN_KEY);
+    const room = localStorage.getItem(ROOM_CODE_KEY);
+    return Boolean(token && room);
+  });
 
   const playerNameRef = useRef<string>('');
   const sessionTokenRef = useRef<string>('');
@@ -35,49 +43,6 @@ export function useGameSocket() {
     gameStateRef.current = gameState;
     versionRef.current = gameState?.version;
   }, [gameState]);
-
-  // Load stored name, token, and check URL invite on mount
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-    const storedName = localStorage.getItem(PLAYER_NAME_KEY) || '';
-    const storedToken = localStorage.getItem(SESSION_TOKEN_KEY) || '';
-    setPlayerNameState(storedName);
-    playerNameRef.current = storedName;
-    setSessionToken(storedToken);
-    sessionTokenRef.current = storedToken;
-
-    // Initialize session with backend
-    fetch('/api/auth/session', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionToken: storedToken, playerName: storedName }),
-    })
-      .then(async res => {
-        if (!res.ok) return null;
-        return res.json();
-      })
-      .then(data => {
-        if (data?.success) {
-          setSessionToken(data.sessionToken);
-          sessionTokenRef.current = data.sessionToken;
-          setPlayerId(data.playerId);
-          localStorage.setItem(SESSION_TOKEN_KEY, data.sessionToken);
-        }
-      })
-      .catch(() => {});
-
-    // Check for direct invite parameter in URL (?room=ABC123)
-    const urlParams = new URLSearchParams(window.location.search);
-    const roomParam = urlParams.get('room');
-    if (roomParam) {
-      const code = roomParam.trim().toUpperCase();
-      if (code.length >= 3) {
-        setInvitedRoomCode(code);
-      }
-    }
-
-    fetchActiveRooms();
-  }, []);
 
   const fetchActiveRooms = useCallback(async () => {
     setIsLoadingRooms(true);
@@ -98,6 +63,183 @@ export function useGameSocket() {
       setIsLoadingRooms(false);
     }
   }, []);
+
+  // Sync game state from server with version check and in-flight deduplication
+  const syncGameState = useCallback(async (roomCode: string, token: string, isInitialRestore: boolean = false) => {
+    if (isSyncingRef.current) return;
+    isSyncingRef.current = true;
+
+    try {
+      const currentVersion = isInitialRestore ? undefined : versionRef.current;
+      const vQuery = currentVersion !== undefined ? `&v=${currentVersion}` : '';
+      const cleanRoom = roomCode.trim().toUpperCase();
+      const res = await fetch(`/api/game/sync?roomCode=${encodeURIComponent(cleanRoom)}&sessionToken=${encodeURIComponent(token)}${vQuery}`);
+
+      if (res.ok) {
+        const data = await res.json();
+        if (data.success) {
+          if (data.notModified) {
+            // State is identical; skip re-render
+          } else if (data.state) {
+            setGameState(data.state);
+            versionRef.current = data.state.version;
+            roomCodeRef.current = data.state.roomCode;
+            if (data.state.myPlayerId) {
+              setPlayerId(data.state.myPlayerId);
+              if (typeof window !== 'undefined') {
+                localStorage.setItem(PLAYER_ID_KEY, data.state.myPlayerId);
+              }
+            }
+            if (typeof window !== 'undefined') {
+              localStorage.setItem(ROOM_CODE_KEY, data.state.roomCode);
+            }
+            setErrorMsg(null);
+          }
+        } else if (data.kicked) {
+          setGameState(null);
+          roomCodeRef.current = null;
+          if (typeof window !== 'undefined') {
+            localStorage.removeItem(ROOM_CODE_KEY);
+          }
+          setErrorMsg(data.error || 'You were removed from the room by the host.');
+        } else if (data.error === 'Room not found' || data.error === 'Room has expired') {
+          setGameState(null);
+          roomCodeRef.current = null;
+          if (typeof window !== 'undefined') {
+            localStorage.removeItem(ROOM_CODE_KEY);
+          }
+          if (data.error === 'Room has expired') {
+            setErrorMsg('This room has expired after 5 minutes in the waiting room.');
+          }
+        }
+      } else {
+        const errData = await res.json().catch(() => ({}));
+        if (res.status === 403 || errData?.kicked) {
+          setGameState(null);
+          roomCodeRef.current = null;
+          if (typeof window !== 'undefined') {
+            localStorage.removeItem(ROOM_CODE_KEY);
+          }
+          setErrorMsg(errData?.error || 'You were removed from the room by the host.');
+        } else if (res.status === 410 || errData?.error === 'Room has expired') {
+          setGameState(null);
+          roomCodeRef.current = null;
+          if (typeof window !== 'undefined') {
+            localStorage.removeItem(ROOM_CODE_KEY);
+          }
+          setErrorMsg('This room has expired after 5 minutes in the waiting room.');
+        } else if (res.status === 404) {
+          setGameState(null);
+          roomCodeRef.current = null;
+          if (typeof window !== 'undefined') {
+            localStorage.removeItem(ROOM_CODE_KEY);
+          }
+        }
+      }
+    } catch {
+      // Network error during sync; do not remove stored room code; will retry on next schedule
+    } finally {
+      isSyncingRef.current = false;
+      if (isInitialRestore) {
+        setIsRestoringSession(false);
+      }
+    }
+  }, []);
+
+  // Load stored name, token, and check URL invite on mount; restore session & room if present
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    let isCancelled = false;
+
+    const storedName = localStorage.getItem(PLAYER_NAME_KEY) || '';
+    const storedToken = localStorage.getItem(SESSION_TOKEN_KEY) || '';
+    const storedRoomCode = localStorage.getItem(ROOM_CODE_KEY) || '';
+    const storedPlayerId = localStorage.getItem(PLAYER_ID_KEY) || '';
+
+    if (storedName) {
+      setPlayerNameState(storedName);
+      playerNameRef.current = storedName;
+    }
+    if (storedToken) {
+      setSessionToken(storedToken);
+      sessionTokenRef.current = storedToken;
+    }
+    if (storedPlayerId) {
+      setPlayerId(storedPlayerId);
+    }
+    if (storedRoomCode) {
+      roomCodeRef.current = storedRoomCode;
+    }
+
+    // Check for direct invite parameter in URL (?room=ABC123)
+    const urlParams = new URLSearchParams(window.location.search);
+    const roomParam = urlParams.get('room');
+    if (roomParam) {
+      const code = roomParam.trim().toUpperCase();
+      if (code.length >= 3) {
+        setInvitedRoomCode(code);
+      }
+    }
+
+    const restoreSession = async () => {
+      try {
+        const res = await fetch('/api/auth/session', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionToken: storedToken || undefined, playerName: storedName || undefined }),
+        });
+
+        if (isCancelled) return;
+
+        if (!res.ok) {
+          setIsRestoringSession(false);
+          fetchActiveRooms();
+          return;
+        }
+
+        const data = await res.json();
+        if (isCancelled) return;
+
+        if (data?.success) {
+          setSessionToken(data.sessionToken);
+          sessionTokenRef.current = data.sessionToken;
+          setPlayerId(data.playerId);
+          localStorage.setItem(SESSION_TOKEN_KEY, data.sessionToken);
+          localStorage.setItem(PLAYER_ID_KEY, data.playerId);
+
+          if (data.playerName) {
+            setPlayerNameState(data.playerName);
+            playerNameRef.current = data.playerName;
+            localStorage.setItem(PLAYER_NAME_KEY, data.playerName);
+          }
+
+          const targetRoomCode = data.roomCode || storedRoomCode;
+
+          if (targetRoomCode) {
+            await syncGameState(targetRoomCode, data.sessionToken, true);
+          } else {
+            setIsRestoringSession(false);
+            fetchActiveRooms();
+          }
+        } else {
+          setIsRestoringSession(false);
+          fetchActiveRooms();
+        }
+      } catch {
+        if (!isCancelled) {
+          setIsRestoringSession(false);
+          fetchActiveRooms();
+        }
+      }
+    };
+
+    restoreSession();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [syncGameState, fetchActiveRooms]);
 
   // Update player name and sync session
   const setPlayerName = useCallback((name: string) => {
@@ -129,60 +271,11 @@ export function useGameSocket() {
           setPlayerId(data.playerId);
           if (typeof window !== 'undefined') {
             localStorage.setItem(SESSION_TOKEN_KEY, data.sessionToken);
+            localStorage.setItem(PLAYER_ID_KEY, data.playerId);
           }
         }
       })
       .catch(() => {});
-  }, []);
-
-  // Sync game state from server with version check and in-flight deduplication
-  const syncGameState = useCallback(async (roomCode: string, token: string) => {
-    if (isSyncingRef.current) return;
-    isSyncingRef.current = true;
-
-    try {
-      const currentVersion = versionRef.current;
-      const vQuery = currentVersion !== undefined ? `&v=${currentVersion}` : '';
-      const res = await fetch(`/api/game/sync?roomCode=${roomCode}&sessionToken=${token}${vQuery}`);
-
-      if (res.ok) {
-        const data = await res.json();
-        if (data.success) {
-          if (data.notModified) {
-            // State is already identical on server; skip state update and re-render
-          } else if (data.state) {
-            setGameState(data.state);
-            versionRef.current = data.state.version;
-            if (data.state.myPlayerId) {
-              setPlayerId(data.state.myPlayerId);
-            }
-          }
-        } else if (data.kicked) {
-          setGameState(null);
-          setErrorMsg(data.error || 'You were removed from the room by the host.');
-        } else if (data.error === 'Room not found' || data.error === 'Room has expired') {
-          setGameState(null);
-          if (data.error === 'Room has expired') {
-            setErrorMsg('This room has expired after 5 minutes in the waiting room.');
-          }
-        }
-      } else {
-        const errData = await res.json().catch(() => ({}));
-        if (res.status === 403 || errData?.kicked) {
-          setGameState(null);
-          setErrorMsg(errData?.error || 'You were removed from the room by the host.');
-        } else if (res.status === 410 || errData?.error === 'Room has expired') {
-          setGameState(null);
-          setErrorMsg('This room has expired after 5 minutes in the waiting room.');
-        } else if (res.status === 404) {
-          setGameState(null);
-        }
-      }
-    } catch {
-      // Network error, will retry on next schedule
-    } finally {
-      isSyncingRef.current = false;
-    }
   }, []);
 
   // Setup WebSocket connection
@@ -371,6 +464,11 @@ export function useGameSocket() {
           }
           if (data.playerId) {
             setPlayerId(data.playerId);
+            localStorage.setItem(PLAYER_ID_KEY, data.playerId);
+          }
+          if (data.roomCode) {
+            localStorage.setItem(ROOM_CODE_KEY, data.roomCode);
+            roomCodeRef.current = data.roomCode;
           }
           setGameState(data.state);
           versionRef.current = data.state.version;
@@ -388,6 +486,7 @@ export function useGameSocket() {
   const joinRoom = useCallback(
     async (roomCode: string, explicitName?: string): Promise<{ success: boolean; error?: string }> => {
       try {
+        const cleanCode = roomCode.trim().toUpperCase();
         const nameToSend = (
           explicitName ||
           playerNameRef.current ||
@@ -407,7 +506,7 @@ export function useGameSocket() {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            roomCode: roomCode.trim().toUpperCase(),
+            roomCode: cleanCode,
             playerName: nameToSend,
             sessionToken: tokenToSend,
           }),
@@ -422,7 +521,10 @@ export function useGameSocket() {
           }
           if (data.playerId) {
             setPlayerId(data.playerId);
+            localStorage.setItem(PLAYER_ID_KEY, data.playerId);
           }
+          localStorage.setItem(ROOM_CODE_KEY, cleanCode);
+          roomCodeRef.current = cleanCode;
           setGameState(data.state);
           versionRef.current = data.state.version;
           return { success: true };
@@ -463,9 +565,17 @@ export function useGameSocket() {
         } else {
           if (res.status === 403 || data.kicked) {
             setGameState(null);
+            roomCodeRef.current = null;
+            if (typeof window !== 'undefined') {
+              localStorage.removeItem(ROOM_CODE_KEY);
+            }
             setErrorMsg(data.error || 'You were removed from the room by the host.');
           } else if (res.status === 410 || data.error === 'Room has expired') {
             setGameState(null);
+            roomCodeRef.current = null;
+            if (typeof window !== 'undefined') {
+              localStorage.removeItem(ROOM_CODE_KEY);
+            }
             setErrorMsg('This room has expired after 5 minutes in the waiting room.');
           }
           return { success: false, error: data.error || 'Action failed' };
@@ -515,12 +625,17 @@ export function useGameSocket() {
       await performGameAction({ type: 'LEAVE_ROOM' });
       setGameState(null);
       versionRef.current = undefined;
+      roomCodeRef.current = null;
+      if (typeof window !== 'undefined') {
+        localStorage.removeItem(ROOM_CODE_KEY);
+      }
     }
   }, [gameState, performGameAction]);
 
   return {
     socket: null,
     isConnected,
+    isRestoringSession,
     gameState,
     playerId,
     playerName,

@@ -76,8 +76,8 @@ describe('Redis Command Consumption Benchmark & Optimization Tests', () => {
       const joinRes = await joinRoute(joinReq);
       expect(joinRes.status).toBe(200);
       const joinCmds = getRedisStats().totalCommands;
-      // Baseline was 10; now 5 (50% reduction!)
-      expect(joinCmds).toBeLessThanOrEqual(5);
+      // Baseline was 10; now 6 (with session roomCode persistence)
+      expect(joinCmds).toBeLessThanOrEqual(6);
 
       // 5. Active Rooms (Lobby Poll)
       resetRedisStats();

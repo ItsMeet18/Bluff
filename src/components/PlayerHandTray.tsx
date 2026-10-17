@@ -28,6 +28,8 @@ interface PlayerHandTrayProps {
   isGameOver?: boolean;
 }
 
+const SELECTED_CARDS_KEY = 'bluff_selected_cards';
+
 export const PlayerHandTray: React.FC<PlayerHandTrayProps> = ({
   hand,
   isMyTurn,
@@ -39,11 +41,40 @@ export const PlayerHandTray: React.FC<PlayerHandTrayProps> = ({
   currentTurnPlayerName,
   isGameOver = false,
 }) => {
-  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [selectedIds, setSelectedIds] = useState<string[]>(() => {
+    if (typeof window === 'undefined') return [];
+    try {
+      const stored = sessionStorage.getItem(SELECTED_CARDS_KEY);
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (Array.isArray(parsed)) {
+          const handSet = new Set(hand.map(c => c.id));
+          return parsed.filter(id => handSet.has(id));
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return [];
+  });
   const [declaredRank, setDeclaredRank] = useState<Rank | null>(null);
   const [showRankPicker, setShowRankPicker] = useState<boolean>(false);
   const [submitting, setSubmitting] = useState<boolean>(false);
   const [actionError, setActionError] = useState<string | null>(null);
+
+  // Sync selected IDs to sessionStorage
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      if (selectedIds.length > 0) {
+        sessionStorage.setItem(SELECTED_CARDS_KEY, JSON.stringify(selectedIds));
+      } else {
+        sessionStorage.removeItem(SELECTED_CARDS_KEY);
+      }
+    } catch {
+      // ignore
+    }
+  }, [selectedIds]);
 
   // Clear selections if hand changes (e.g. after playing or receiving penalty block) or turn finishes
   useEffect(() => {
@@ -69,6 +100,11 @@ export const PlayerHandTray: React.FC<PlayerHandTrayProps> = ({
     setDeclaredRank(null);
     setShowRankPicker(false);
     setActionError(null);
+    if (typeof window !== 'undefined') {
+      try {
+        sessionStorage.removeItem(SELECTED_CARDS_KEY);
+      } catch {}
+    }
   };
 
   const handlePlaySubmit = async () => {

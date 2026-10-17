@@ -136,13 +136,13 @@ export class GameRoom {
     return { success: true, roomEmpty: this.players.length === 0 };
   }
 
-  public reconnectPlayer(id: string, socketId: string): { success: boolean; error?: string } {
+  public reconnectPlayer(id: string, socketId?: string): { success: boolean; error?: string } {
     const player = this.players.find(p => p.id === id);
     if (!player) {
       return { success: false, error: 'Player not found in this room' };
     }
 
-    player.socketId = socketId;
+    if (socketId) player.socketId = socketId;
     player.isConnected = true;
     this.addLog('join', `${player.name} reconnected.`, id);
     this.touch();
