@@ -25,6 +25,7 @@ export default function BluffApp() {
     createRoom,
     joinRoom,
     startGame,
+    kickPlayer,
     playCards,
     passTurn,
     callBluff,
@@ -141,6 +142,11 @@ export default function BluffApp() {
     return await playAgain();
   };
 
+  const handleKickPlayer = async (targetPlayerId: string) => {
+    playCardClick();
+    return await kickPlayer(targetPlayerId);
+  };
+
   const handleLeaveRoom = () => {
     playCardClick();
     setInvitedRoomCode(null);
@@ -188,6 +194,7 @@ export default function BluffApp() {
             myPlayerId={playerId}
             onStartGame={handleStartGame}
             onLeaveRoom={handleLeaveRoom}
+            onKickPlayer={handleKickPlayer}
           />
         ) : (
           <GameTable
@@ -198,6 +205,7 @@ export default function BluffApp() {
             onCallBluff={handleCallBluff}
             onPlayAgain={handlePlayAgain}
             onLeaveRoom={handleLeaveRoom}
+            onKickPlayer={handleKickPlayer}
           />
         )}
       </main>

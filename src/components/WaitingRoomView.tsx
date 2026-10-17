@@ -1,14 +1,14 @@
-'use client';
-
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { PublicGameState } from '../types/game';
-import { Copy, Check, Users, Crown, Layers, Play, AlertCircle, Share2, Shield, LogOut } from 'lucide-react';
+import { Copy, Check, Users, Crown, Layers, Play, AlertCircle, Share2, LogOut, Clock, MoreVertical, UserX } from 'lucide-react';
+import { KickConfirmationModal } from './KickConfirmationModal';
 
 interface WaitingRoomViewProps {
   gameState: PublicGameState;
   myPlayerId: string;
   onStartGame: () => Promise<{ success: boolean; error?: string }>;
   onLeaveRoom: () => void;
+  onKickPlayer?: (targetPlayerId: string) => Promise<{ success: boolean; error?: string }>;
 }
 
 export const WaitingRoomView: React.FC<WaitingRoomViewProps> = ({
@@ -16,16 +16,59 @@ export const WaitingRoomView: React.FC<WaitingRoomViewProps> = ({
   myPlayerId,
   onStartGame,
   onLeaveRoom,
+  onKickPlayer,
 }) => {
   const [copiedCode, setCopiedCode] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [activeMenuPlayerId, setActiveMenuPlayerId] = useState<string | null>(null);
+  const [kickTargetPlayer, setKickTargetPlayer] = useState<{ id: string; name: string } | null>(null);
+
+  const calculateRemaining = () => {
+    if (!gameState.waitingRoomExpiresAt) return 300;
+    return Math.max(0, Math.floor((gameState.waitingRoomExpiresAt - Date.now()) / 1000));
+  };
+
+  const [remainingSeconds, setRemainingSeconds] = useState<number>(calculateRemaining);
+
+  useEffect(() => {
+    if (!gameState.waitingRoomExpiresAt || gameState.status !== 'waiting') return;
+
+    setRemainingSeconds(calculateRemaining());
+    const interval = setInterval(() => {
+      const remaining = calculateRemaining();
+      setRemainingSeconds(remaining);
+      if (remaining <= 0) {
+        clearInterval(interval);
+        setError('This room has expired after 5 minutes in the waiting room.');
+        setTimeout(() => {
+          onLeaveRoom();
+        }, 2500);
+      }
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [gameState.waitingRoomExpiresAt, gameState.status, onLeaveRoom]);
+
+  const formatCountdown = (totalSeconds: number) => {
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  };
 
   const effectiveMyId = myPlayerId || gameState.myPlayerId;
   const me = gameState.players.find(p => p.id === effectiveMyId);
   const isHost = me?.isHost || gameState.config.hostId === effectiveMyId;
   const canStart = gameState.players.length >= gameState.config.minPlayers;
+
+  const handleConfirmKick = async (targetPlayerId: string) => {
+    if (!onKickPlayer) return;
+    const res = await onKickPlayer(targetPlayerId);
+    if (!res.success) {
+      throw new Error(res.error || 'Failed to kick player');
+    }
+  };
 
   const copyCode = () => {
     navigator.clipboard.writeText(gameState.roomCode);
@@ -103,6 +146,22 @@ export const WaitingRoomView: React.FC<WaitingRoomViewProps> = ({
             </div>
           </div>
 
+          {/* Waiting Room Expiration Countdown */}
+          {gameState.status === 'waiting' && gameState.waitingRoomExpiresAt && (
+            <div className="mt-3 flex items-center justify-center">
+              <div
+                className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold border transition-colors ${
+                  remainingSeconds <= 60
+                    ? 'bg-rose-500/15 border-rose-500/40 text-rose-300 animate-pulse'
+                    : 'bg-amber-500/10 border-amber-500/30 text-amber-300'
+                }`}
+              >
+                <Clock className="w-3.5 h-3.5" />
+                <span>Room closes in {formatCountdown(remainingSeconds)}</span>
+              </div>
+            </div>
+          )}
+
           {/* Quick share button */}
           <div className="mt-3.5 pt-3.5 border-t border-slate-800/80 flex justify-center">
             <button
@@ -167,15 +226,54 @@ export const WaitingRoomView: React.FC<WaitingRoomViewProps> = ({
                   </div>
                 </div>
 
-                <div className="flex items-center gap-1.5 shrink-0">
-                  <span
-                    className={`w-2 h-2 rounded-full ${
-                      p.isConnected ? 'bg-emerald-400 shadow-glow-emerald' : 'bg-slate-600'
-                    }`}
-                  />
-                  <span className="text-[11px] text-slate-400 font-medium hidden sm:inline">
-                    {p.isConnected ? 'Ready' : 'Connecting...'}
-                  </span>
+                <div className="flex items-center gap-2 shrink-0">
+                  <div className="flex items-center gap-1.5">
+                    <span
+                      className={`w-2 h-2 rounded-full ${
+                        p.isConnected ? 'bg-emerald-400 shadow-glow-emerald' : 'bg-slate-600'
+                      }`}
+                    />
+                    <span className="text-[11px] text-slate-400 font-medium hidden sm:inline">
+                      {p.isConnected ? 'Ready' : 'Connecting...'}
+                    </span>
+                  </div>
+
+                  {/* Host-only player options overflow menu */}
+                  {isHost && p.id !== effectiveMyId && (
+                    <div className="relative">
+                      <button
+                        type="button"
+                        onClick={() => setActiveMenuPlayerId(activeMenuPlayerId === p.id ? null : p.id)}
+                        title="Player options"
+                        aria-label={`Options for ${p.name}`}
+                        className="p-1 sm:p-1.5 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition-colors"
+                      >
+                        <MoreVertical className="w-4 h-4" />
+                      </button>
+
+                      {activeMenuPlayerId === p.id && (
+                        <>
+                          <div
+                            className="fixed inset-0 z-20"
+                            onClick={() => setActiveMenuPlayerId(null)}
+                          />
+                          <div className="absolute right-0 top-full mt-1 w-32 bg-slate-900 border border-slate-700/80 rounded-xl shadow-xl py-1 z-30 animate-fade-in">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setKickTargetPlayer({ id: p.id, name: p.name });
+                                setActiveMenuPlayerId(null);
+                              }}
+                              className="w-full px-3 py-1.5 text-left text-xs font-semibold text-rose-400 hover:bg-rose-500/15 hover:text-rose-300 flex items-center gap-2 transition-colors"
+                            >
+                              <UserX className="w-3.5 h-3.5" />
+                              <span>Kick Player</span>
+                            </button>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
             ))}
@@ -232,6 +330,15 @@ export const WaitingRoomView: React.FC<WaitingRoomViewProps> = ({
           )}
         </div>
       </div>
+
+      {/* Kick Confirmation Modal */}
+      <KickConfirmationModal
+        isOpen={kickTargetPlayer !== null}
+        targetPlayer={kickTargetPlayer}
+        onConfirm={handleConfirmKick}
+        onClose={() => setKickTargetPlayer(null)}
+        isWaitingRoom={true}
+      />
     </div>
   );
 };

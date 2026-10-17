@@ -20,6 +20,14 @@ export async function POST(req: NextRequest) {
     const actionPayload = payload || (typeof action === 'object' ? action : {});
 
     const { result, room: updatedRoom } = await roomStore.runAtomic(roomCode, room => {
+      if (room.isWaitingRoomExpired()) {
+        return { result: { success: false, error: 'Room has expired' }, changed: false };
+      }
+
+      if (room.kickedPlayerIds?.includes(playerId)) {
+        return { result: { success: false, error: 'You have been removed from this room by the host' }, changed: false };
+      }
+
       const player = room.players.find(p => p.id === playerId);
       if (!player && actionName !== 'leave_room') {
         return { result: { success: false, error: 'Player not in this room' }, changed: false };
@@ -28,6 +36,15 @@ export async function POST(req: NextRequest) {
       switch (actionName) {
         case 'start_game': {
           const res = room.startGame(playerId);
+          return { result: res, changed: res.success };
+        }
+
+        case 'kick_player': {
+          const targetPlayerId = actionPayload.targetPlayerId || actionPayload.playerId;
+          if (!targetPlayerId) {
+            return { result: { success: false, error: 'Target player ID is required' }, changed: false };
+          }
+          const res = room.kickPlayer(playerId, targetPlayerId);
           return { result: res, changed: res.success };
         }
 

@@ -138,7 +138,8 @@ export interface FullGameState {
   winnerId: string | null;
   finishingPositions: FinishingPosition[];
   lastRevealedChallenge: RevealedChallengeCard | null;
-  eventLogs: GameEventLog[];
+  waitingRoomExpiresAt?: number | null;
+  kickedPlayerIds?: string[];
   createdAt: number;
   updatedAt: number;
 }
@@ -166,6 +167,7 @@ export interface PublicGameState {
   isSpectator: boolean;
   activePlayersCount: number;
   version?: number;
+  waitingRoomExpiresAt?: number | null;
 }
 
 export interface CreateRoomDto {

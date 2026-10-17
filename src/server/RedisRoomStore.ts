@@ -151,13 +151,18 @@ export class RedisRoomStore {
 
   // --- Room Fetch & Save ---
 
-  public async getRoom(roomCode: string): Promise<GameRoom | null> {
+  public async getRoom(roomCode: string, allowExpired: boolean = false): Promise<GameRoom | null> {
     const cleanCode = roomCode.trim().toUpperCase();
     const data = await redis.get(this.roomKey(cleanCode));
     if (!data) return null;
     try {
       const parsed = typeof data === 'string' ? JSON.parse(data) : data;
-      return GameRoom.fromJSON(parsed);
+      const room = GameRoom.fromJSON(parsed);
+      if (!allowExpired && room.isWaitingRoomExpired()) {
+        await this.deleteRoom(cleanCode);
+        return null;
+      }
+      return room;
     } catch {
       return null;
     }
@@ -221,9 +226,14 @@ export class RedisRoomStore {
 
     let loadedRoom: GameRoom | null = null;
     try {
-      loadedRoom = await this.getRoom(cleanCode);
+      loadedRoom = await this.getRoom(cleanCode, true);
       if (!loadedRoom) {
         throw new Error(`Room ${cleanCode} does not exist`);
+      }
+
+      if (loadedRoom.isWaitingRoomExpired()) {
+        await this.deleteRoom(cleanCode);
+        throw new Error('Room has expired');
       }
 
       const previousStatus = loadedRoom.status;
@@ -345,6 +355,17 @@ export class RedisRoomStore {
             `Player_${session.playerId.slice(-4)}`;
           session.playerName = effectiveName;
 
+          if (room.isWaitingRoomExpired()) {
+            return { result: { success: false, error: 'Room has expired' }, changed: false };
+          }
+
+          if (room.kickedPlayerIds?.includes(session.playerId)) {
+            return {
+              result: { success: false, error: 'You have been removed from this room by the host' },
+              changed: false,
+            };
+          }
+
           if (room.status !== 'waiting') {
             const existingPlayer = room.players.find(p => p.id === session.playerId);
             if (existingPlayer) {
@@ -377,6 +398,9 @@ export class RedisRoomStore {
       }
       return res;
     } catch (err: any) {
+      if (err.message && err.message.includes('expired')) {
+        return { success: false, error: 'Room has expired' };
+      }
       if (err.message && err.message.includes('does not exist')) {
         return { success: false, error: `Room ${cleanCode} not found` };
       }
@@ -416,7 +440,7 @@ export class RedisRoomStore {
         }
       }
 
-      if (room && room.status === 'waiting' && room.players.length < room.config.maxPlayers) {
+      if (room && room.status === 'waiting' && !room.isWaitingRoomExpired() && room.players.length < room.config.maxPlayers) {
         const host = room.players.find(p => p.id === room.config.hostId) || room.players[0];
         list.push({
           roomCode: room.roomCode,
@@ -429,6 +453,10 @@ export class RedisRoomStore {
         });
       } else {
         staleCodes.push(code);
+        if (room && room.isWaitingRoomExpired()) {
+          // Immediately delete expired room from Redis
+          await redis.del(this.roomKey(code));
+        }
       }
     }
 

@@ -1,21 +1,25 @@
-'use client';
-
-import React from 'react';
+import React, { useState } from 'react';
 import { PublicPlayer } from '../types/game';
-import { Crown, WifiOff, Layers, Eye } from 'lucide-react';
+import { Crown, WifiOff, Layers, Eye, MoreVertical, UserX } from 'lucide-react';
 import { clsx } from 'clsx';
 
 interface OpponentPanelProps {
   player: PublicPlayer;
   isCurrentTurn: boolean;
   isLastPlaySource: boolean;
+  isHost?: boolean;
+  onRequestKick?: (player: PublicPlayer) => void;
 }
 
 export const OpponentPanel: React.FC<OpponentPanelProps> = ({
   player,
   isCurrentTurn,
   isLastPlaySource,
+  isHost = false,
+  onRequestKick,
 }) => {
+  const [menuOpen, setMenuOpen] = useState(false);
+
   return (
     <div
       className={clsx(
@@ -28,6 +32,49 @@ export const OpponentPanel: React.FC<OpponentPanelProps> = ({
         !player.isConnected && 'opacity-60'
       )}
     >
+      {/* Discreet Host Options Overflow Menu */}
+      {isHost && !player.isHost && onRequestKick && (
+        <div className="absolute top-1.5 right-1.5 z-20">
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              setMenuOpen(!menuOpen);
+            }}
+            title="Player options"
+            aria-label={`Options for ${player.name}`}
+            className="p-1 rounded-md text-slate-400 hover:text-slate-200 hover:bg-slate-800/80 transition-colors"
+          >
+            <MoreVertical className="w-3.5 h-3.5" />
+          </button>
+
+          {menuOpen && (
+            <>
+              <div
+                className="fixed inset-0 z-30"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setMenuOpen(false);
+                }}
+              />
+              <div className="absolute right-0 top-full mt-1 w-28 bg-slate-900 border border-slate-700/80 rounded-xl shadow-2xl py-1 z-40 animate-fade-in">
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setMenuOpen(false);
+                    onRequestKick(player);
+                  }}
+                  className="w-full px-2.5 py-1.5 text-left text-[11px] font-semibold text-rose-400 hover:bg-rose-500/15 hover:text-rose-300 flex items-center gap-1.5 transition-colors"
+                >
+                  <UserX className="w-3 h-3" />
+                  <span>Kick Player</span>
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
       {/* Current Turn Badge */}
       {isCurrentTurn && !player.isSpectator && (
         <span className="absolute -top-3 bg-gradient-to-r from-amber-400 to-amber-500 text-slate-950 text-[10px] font-black uppercase px-2 py-0.5 rounded-full shadow-md animate-bounce">

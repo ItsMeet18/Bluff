@@ -36,6 +36,8 @@ export class GameRoom {
   public eventLogs: GameEventLog[] = [];
   public isResolvingChallenge: boolean = false;
   public version: number = 1;
+  public waitingRoomExpiresAt: number | null = null;
+  public kickedPlayerIds: string[] = [];
   public createdAt: number;
   public updatedAt: number;
 
@@ -51,6 +53,12 @@ export class GameRoom {
     };
     this.createdAt = Date.now();
     this.updatedAt = Date.now();
+    // 5-minute server-authoritative waiting room expiration deadline
+    this.waitingRoomExpiresAt = this.createdAt + 5 * 60 * 1000;
+  }
+
+  public isWaitingRoomExpired(): boolean {
+    return this.status === 'waiting' && this.waitingRoomExpiresAt !== null && Date.now() >= this.waitingRoomExpiresAt;
   }
 
   // --- Player Management ---
@@ -150,11 +158,129 @@ export class GameRoom {
     }
   }
 
+  public kickPlayer(requesterId: string, targetPlayerId: string): { success: boolean; error?: string } {
+    if (this.config.hostId !== requesterId) {
+      return { success: false, error: 'Only the host can kick players' };
+    }
+
+    if (requesterId === targetPlayerId) {
+      return { success: false, error: 'Host cannot kick themselves' };
+    }
+
+    const targetIndex = this.players.findIndex(p => p.id === targetPlayerId);
+    if (targetIndex === -1) {
+      return { success: false, error: 'Target player not found in this room' };
+    }
+
+    const targetPlayer = this.players[targetIndex];
+    const targetPlayerName = targetPlayer.name;
+
+    // Track in kickedPlayerIds to permanently prevent stale sessions from acting or syncing
+    if (!this.kickedPlayerIds.includes(targetPlayerId)) {
+      this.kickedPlayerIds.push(targetPlayerId);
+    }
+
+    // --- Waiting Room Kick ---
+    if (this.status === 'waiting') {
+      this.players.splice(targetIndex, 1);
+      this.addLog('leave', `👑 Host kicked ${targetPlayerName} from the waiting room.`, requesterId);
+      this.touch();
+      return { success: true };
+    }
+
+    // --- In-Game Kick ---
+    // 1. Discard every card in the kicked player's hand; awarded to NO player
+    targetPlayer.cards = [];
+
+    // 2. Remove player completely from active player list so they never appear on final leaderboard
+    this.players.splice(targetIndex, 1);
+
+    // 3. Exclude from finishingPositions and recalculate positions for remaining players
+    this.finishingPositions = this.finishingPositions.filter(fp => fp.playerId !== targetPlayerId);
+    this.finishingPositions.forEach((fp, idx) => {
+      fp.position = idx + 1;
+      const p = this.players.find(pl => pl.id === fp.playerId);
+      if (p) p.finishPosition = fp.position;
+    });
+
+    // 4. Recalculate turn order immediately
+    const currentTurnPlayer = this.getCurrentPlayer();
+    const currentTurnPlayerId = currentTurnPlayer?.id;
+    const targetOrderIdx = this.playerOrder.indexOf(targetPlayerId);
+
+    if (targetOrderIdx !== -1) {
+      this.playerOrder.splice(targetOrderIdx, 1);
+    }
+
+    if (this.playerOrder.length > 0) {
+      if (currentTurnPlayerId === targetPlayerId) {
+        // The kicked player owned the turn: advance to next eligible player
+        this.currentTurnIndex = targetOrderIdx % this.playerOrder.length;
+      } else if (currentTurnPlayerId) {
+        const newTurnIdx = this.playerOrder.indexOf(currentTurnPlayerId);
+        this.currentTurnIndex = newTurnIdx !== -1 ? newTurnIdx : 0;
+      } else {
+        this.currentTurnIndex = 0;
+      }
+
+      // Ensure turn is on an active (non-spectator) player
+      const activeRemaining = this.getActivePlayers();
+      if (activeRemaining.length > 0) {
+        const curr = this.getCurrentPlayer();
+        if (!curr || curr.isSpectator) {
+          this.advanceTurn();
+        }
+      }
+    } else {
+      this.currentTurnIndex = 0;
+    }
+
+    // 5. Clean up cards in block: ensure kicked player's cards cannot be selected, revealed, collected, or referenced
+    const kickedCardIds = new Set<string>();
+    this.contributions.forEach(c => {
+      if (c.playerId === targetPlayerId) {
+        c.cardIds.forEach(id => kickedCardIds.add(id));
+      }
+    });
+
+    if (kickedCardIds.size > 0) {
+      this.blockCards = this.blockCards.filter(c => !kickedCardIds.has(c.id));
+      this.contributions = this.contributions.filter(c => c.playerId !== targetPlayerId);
+    }
+
+    if (this.lastPlay?.playerId === targetPlayerId) {
+      this.lastPlay = this.contributions.length > 0 ? this.contributions[this.contributions.length - 1] : null;
+      if (this.lastPlay) {
+        this.lastPlayerToPlayId = this.lastPlay.playerId;
+      } else {
+        this.lastPlayerToPlayId = null;
+        this.activeRank = null;
+        this.blockCards = [];
+        this.consecutivePasses = 0;
+      }
+    }
+
+    this.addLog('leave', `👑 Host kicked ${targetPlayerName} from the game.`, requesterId);
+
+    // 6. Check if game reached end condition (e.g. only 1 active player remains)
+    const isGameOver = this.checkGameOver();
+    if (!isGameOver) {
+      this.finalizeTitles();
+    }
+
+    this.touch();
+    return { success: true };
+  }
+
   // --- Game Lifecycle ---
 
   public startGame(requesterId: string): { success: boolean; error?: string } {
     if (this.status !== 'waiting') {
       return { success: false, error: 'Game has already started' };
+    }
+
+    if (this.isWaitingRoomExpired()) {
+      return { success: false, error: 'Room has expired' };
     }
 
     if (this.config.hostId !== requesterId) {
@@ -180,6 +306,7 @@ export class GameRoom {
     });
 
     this.status = 'in_progress';
+    this.waitingRoomExpiresAt = null; // Permanently cancel waiting room timeout
     this.currentTurnIndex = Math.floor(Math.random() * this.players.length);
     this.activeRank = null;
     this.lastPlay = null;
@@ -678,6 +805,7 @@ export class GameRoom {
     }
 
     this.status = 'waiting';
+    this.waitingRoomExpiresAt = Date.now() + 5 * 60 * 1000; // Reset waiting room timer on rematch
     this.activeRank = null;
     this.lastPlay = null;
     this.contributions = [];
@@ -823,6 +951,7 @@ export class GameRoom {
       isSpectator: !!requestingPlayer?.isSpectator,
       activePlayersCount: this.getActivePlayers().length,
       version: this.version,
+      waitingRoomExpiresAt: this.waitingRoomExpiresAt,
     };
   }
 
@@ -848,6 +977,8 @@ export class GameRoom {
       eventLogs: this.eventLogs,
       isResolvingChallenge: this.isResolvingChallenge,
       version: this.version,
+      waitingRoomExpiresAt: this.waitingRoomExpiresAt,
+      kickedPlayerIds: this.kickedPlayerIds,
       createdAt: this.createdAt,
       updatedAt: this.updatedAt,
     };
@@ -877,6 +1008,10 @@ export class GameRoom {
     room.eventLogs = data.eventLogs || [];
     room.isResolvingChallenge = !!data.isResolvingChallenge;
     room.version = typeof data.version === 'number' ? data.version : 1;
+    room.waitingRoomExpiresAt = typeof data.waitingRoomExpiresAt === 'number' || data.waitingRoomExpiresAt === null
+      ? data.waitingRoomExpiresAt
+      : (data.status === 'waiting' ? room.createdAt + 5 * 60 * 1000 : null);
+    room.kickedPlayerIds = Array.isArray(data.kickedPlayerIds) ? data.kickedPlayerIds : [];
     room.createdAt = data.createdAt || Date.now();
     room.updatedAt = data.updatedAt || Date.now();
     return room;

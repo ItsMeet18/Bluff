@@ -9,6 +9,7 @@ import { ChallengeModal } from './ChallengeModal';
 import { ChallengeRevealBanner } from './ChallengeRevealBanner';
 import { EventLogDrawer } from './EventLogDrawer';
 import { GameOverModal } from './GameOverModal';
+import { KickConfirmationModal } from './KickConfirmationModal';
 
 import { Zap } from 'lucide-react';
 
@@ -20,6 +21,7 @@ interface GameTableProps {
   onCallBluff: (selectedCardId: string) => Promise<{ success: boolean; error?: string }>;
   onPlayAgain: () => Promise<{ success: boolean; error?: string }>;
   onLeaveRoom: () => void;
+  onKickPlayer?: (targetPlayerId: string) => Promise<{ success: boolean; error?: string }>;
 }
 
 export const GameTable: React.FC<GameTableProps> = ({
@@ -30,9 +32,11 @@ export const GameTable: React.FC<GameTableProps> = ({
   onCallBluff,
   onPlayAgain,
   onLeaveRoom,
+  onKickPlayer,
 }) => {
   const [isBluffModalOpen, setIsBluffModalOpen] = useState(false);
   const [isChallenging, setIsChallenging] = useState(false);
+  const [kickTargetPlayer, setKickTargetPlayer] = useState<{ id: string; name: string } | null>(null);
 
   const {
     players,
@@ -51,6 +55,8 @@ export const GameTable: React.FC<GameTableProps> = ({
   // Filter opponents
   const opponents = players.filter(p => p.id !== myPlayerId);
   const currentTurnPlayer = players.find(p => p.id === currentTurnPlayerId);
+  const me = players.find(p => p.id === myPlayerId);
+  const isHost = me?.isHost || gameState.config.hostId === myPlayerId;
 
   // Can the current user challenge?
   // Only if: it is their turn, there is a last play, and the last play was NOT made by themselves
@@ -83,6 +89,8 @@ export const GameTable: React.FC<GameTableProps> = ({
               player={opp}
               isCurrentTurn={opp.id === currentTurnPlayerId}
               isLastPlaySource={lastPlay?.playerId === opp.id}
+              isHost={isHost}
+              onRequestKick={(p) => setKickTargetPlayer({ id: p.id, name: p.name })}
             />
           ))}
         </div>
@@ -148,6 +156,19 @@ export const GameTable: React.FC<GameTableProps> = ({
           onLeaveRoom={onLeaveRoom}
         />
       )}
+
+      {/* Kick Confirmation Modal */}
+      <KickConfirmationModal
+        isOpen={kickTargetPlayer !== null}
+        targetPlayer={kickTargetPlayer}
+        onConfirm={async (targetId) => {
+          if (!onKickPlayer) return;
+          const res = await onKickPlayer(targetId);
+          if (!res.success) throw new Error(res.error || 'Failed to kick player');
+        }}
+        onClose={() => setKickTargetPlayer(null)}
+        isWaitingRoom={false}
+      />
     </div>
   );
 };

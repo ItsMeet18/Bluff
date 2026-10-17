@@ -157,7 +157,24 @@ export function useGameSocket() {
               setPlayerId(data.state.myPlayerId);
             }
           }
+        } else if (data.kicked) {
+          setGameState(null);
+          setErrorMsg(data.error || 'You were removed from the room by the host.');
         } else if (data.error === 'Room not found' || data.error === 'Room has expired') {
+          setGameState(null);
+          if (data.error === 'Room has expired') {
+            setErrorMsg('This room has expired after 5 minutes in the waiting room.');
+          }
+        }
+      } else {
+        const errData = await res.json().catch(() => ({}));
+        if (res.status === 403 || errData?.kicked) {
+          setGameState(null);
+          setErrorMsg(errData?.error || 'You were removed from the room by the host.');
+        } else if (res.status === 410 || errData?.error === 'Room has expired') {
+          setGameState(null);
+          setErrorMsg('This room has expired after 5 minutes in the waiting room.');
+        } else if (res.status === 404) {
           setGameState(null);
         }
       }
@@ -444,6 +461,13 @@ export function useGameSocket() {
           }
           return { success: true, result: data.result };
         } else {
+          if (res.status === 403 || data.kicked) {
+            setGameState(null);
+            setErrorMsg(data.error || 'You were removed from the room by the host.');
+          } else if (res.status === 410 || data.error === 'Room has expired') {
+            setGameState(null);
+            setErrorMsg('This room has expired after 5 minutes in the waiting room.');
+          }
           return { success: false, error: data.error || 'Action failed' };
         }
       } catch (err: any) {
@@ -456,6 +480,13 @@ export function useGameSocket() {
   const startGame = useCallback((): Promise<{ success: boolean; error?: string }> => {
     return performGameAction({ type: 'START_GAME' });
   }, [performGameAction]);
+
+  const kickPlayer = useCallback(
+    (targetPlayerId: string): Promise<{ success: boolean; error?: string }> => {
+      return performGameAction({ type: 'KICK_PLAYER', targetPlayerId });
+    },
+    [performGameAction]
+  );
 
   const playCards = useCallback(
     (cardIds: string[], declaredRank?: Rank): Promise<{ success: boolean; error?: string }> => {
@@ -505,6 +536,7 @@ export function useGameSocket() {
     createRoom,
     joinRoom,
     startGame,
+    kickPlayer,
     playCards,
     passTurn,
     callBluff,

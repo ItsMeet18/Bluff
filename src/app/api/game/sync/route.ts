@@ -14,9 +14,27 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ success: false, error: 'Room code is required' }, { status: 400 });
     }
 
-    const room = await roomStore.getRoom(roomCode);
+    const room = await roomStore.getRoom(roomCode, true);
     if (!room) {
       return NextResponse.json({ success: false, error: 'Room not found' }, { status: 404 });
+    }
+
+    if (room.isWaitingRoomExpired()) {
+      await roomStore.deleteRoom(roomCode);
+      return NextResponse.json({ success: false, error: 'Room has expired' }, { status: 410 });
+    }
+
+    // Resolves via in-process session cache (0 Redis commands on warm lambda)
+    const session = sessionToken ? await roomStore.getSession(sessionToken) : null;
+    if (session && room.kickedPlayerIds?.includes(session.playerId)) {
+      if (session.roomCode === room.roomCode) {
+        session.roomCode = undefined;
+        await roomStore.saveSession(session);
+      }
+      return NextResponse.json(
+        { success: false, error: 'You were removed from the room by the host', kicked: true },
+        { status: 403 }
+      );
     }
 
     // If client already has the latest state version, return lightweight 200 notModified
@@ -25,8 +43,6 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ success: true, notModified: true, version: room.version });
     }
 
-    // Resolves via in-process session cache (0 Redis commands on warm lambda)
-    const session = sessionToken ? await roomStore.getSession(sessionToken) : null;
     const state = room.getPublicState(session?.playerId);
 
     return NextResponse.json({ success: true, state, version: room.version });
@@ -45,16 +61,32 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ success: false, error: 'Room code is required' }, { status: 400 });
     }
 
-    const room = await roomStore.getRoom(roomCode);
+    const room = await roomStore.getRoom(roomCode, true);
     if (!room) {
       return NextResponse.json({ success: false, error: 'Room not found' }, { status: 404 });
+    }
+
+    if (room.isWaitingRoomExpired()) {
+      await roomStore.deleteRoom(roomCode);
+      return NextResponse.json({ success: false, error: 'Room has expired' }, { status: 410 });
+    }
+
+    const session = sessionToken ? await roomStore.getSession(sessionToken) : null;
+    if (session && room.kickedPlayerIds?.includes(session.playerId)) {
+      if (session.roomCode === room.roomCode) {
+        session.roomCode = undefined;
+        await roomStore.saveSession(session);
+      }
+      return NextResponse.json(
+        { success: false, error: 'You were removed from the room by the host', kicked: true },
+        { status: 403 }
+      );
     }
 
     if (clientVersion && String(room.version) === String(clientVersion)) {
       return NextResponse.json({ success: true, notModified: true, version: room.version });
     }
 
-    const session = sessionToken ? await roomStore.getSession(sessionToken) : null;
     const state = room.getPublicState(session?.playerId);
 
     return NextResponse.json({ success: true, state, version: room.version });
